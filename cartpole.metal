@@ -2,19 +2,6 @@
 #include "rollout.h"
 using namespace metal;
 
-//xorshift32. Seed with a nonzero value.
-inline uint rngNext(thread uint& s) {
-    s ^= s << 13;
-    s ^= s >> 17;
-    s ^= s << 5;
-    return s;
-}
-
-//uniform float in [lo, hi)
-inline float rngUniform(thread uint& s, float lo, float hi) {
-    return lo + (hi - lo) * float(rngNext(s) >> 8) * (1.0f / 16777216.0f);
-}
-
 struct CartPole {
     struct State {
         float x;

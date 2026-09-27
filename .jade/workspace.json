@@ -4,6 +4,18 @@
       {
         "path": "/Users/seanchang/projects/CLionProjects/metalRL/main.cpp",
         "isDirty": false
+      },
+      {
+        "path": "/Users/seanchang/projects/CLionProjects/metalRL/gym.h",
+        "isDirty": false
+      },
+      {
+        "path": "/Users/seanchang/projects/CLionProjects/metalRL/cartpole.metal",
+        "isDirty": false
+      },
+      {
+        "path": "/Users/seanchang/projects/CLionProjects/metalRL/README.md",
+        "isDirty": true
       }
     ],
     "fileTreeVisible": true,
@@ -27,6 +39,6 @@
     "dipSwitches": [],
     "markdownVisible": true,
     "markdownWidth": 420.0,
-    "activeTabIndex": 0
+    "activeTabIndex": 3
   }
 }
