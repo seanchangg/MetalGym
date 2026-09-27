@@ -10,6 +10,13 @@ struct CartPole {
         float thetaDot;
         uint steps;
     };
+    using Action = int; //0 = push left, 1 = push right
+    struct Obs {
+        float x;
+        float xDot;
+        float theta;
+        float thetaDot;
+    };
 
     constant static constexpr uint OBS_DIM = 4;
     constant static constexpr uint ACT_DIM = 2;
@@ -34,14 +41,14 @@ struct CartPole {
         s.steps    = 0;
     }
 
-    static void observe(thread const State& s, device float* obs) {
-        obs[0] = s.x;
-        obs[1] = s.xDot;
-        obs[2] = s.theta;
-        obs[3] = s.thetaDot;
+    static void observe(thread const State& s, thread Obs& obs) {
+        obs.x        = s.x;
+        obs.xDot     = s.xDot;
+        obs.theta    = s.theta;
+        obs.thetaDot = s.thetaDot;
     }
 
-    static void step(thread State& s, int action, device float* obs,
+    static void step(thread State& s, Action action, thread Obs& obs,
                      thread float& reward, thread uchar& done) {
         float force = (action == 1) ? FORCE_MAG : -FORCE_MAG;
         float cosTheta = cos(s.theta);
@@ -70,9 +77,9 @@ struct CartPole {
 
 template [[host_name("rollout_cartpole")]]
 kernel void rollout<CartPole>(
-	device CartPole::State*, 
-	device const int*,
-	device float*,
+	device CartPole::State*,
+	device const CartPole::Action*,
+	device CartPole::Obs*,
 	device float*,
 	device uchar*,
 	device uint*,

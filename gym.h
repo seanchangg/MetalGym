@@ -1,3 +1,4 @@
+#pragma once
 #define NS_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
@@ -30,10 +31,10 @@ struct Gym {
     size_t rewardBytes;
     size_t doneBytes;
     size_t rngBytes;
-    uint32_t parallel_worlds;
+    uint32_t parallels;
 
-    Gym(int p) : parallel_worlds(p), stateBytes(p*sizeof(typename Env::State)), actionBytes(p*Env::ACT_DIM*sizeof(int)), 
-   				 obsBytes(p*Env::OBS_DIM*sizeof(float)), rewardBytes(p*sizeof(float)), doneBytes(p*sizeof(uint8_t)), 
+    Gym(int p) : parallels(p), stateBytes(p*sizeof(typename Env::State)), actionBytes(p*sizeof(typename Env::Action)), 
+   				 obsBytes(p*sizeof(typename Env::Obs)), rewardBytes(p*sizeof(float)), doneBytes(p*sizeof(uint8_t)), 
    				 rngBytes(p*sizeof(uint32_t))  
    	{
         pool = NS::AutoreleasePool::alloc()->init();
@@ -55,7 +56,7 @@ struct Gym {
         std::memset(actionBuffer->contents(), 0, actionBytes);
         //xorshift stays at zero forever, so every rng slot needs a nonzero seed
         auto* rngInit = static_cast<uint32_t*>(rngBuffer->contents());
-        for (uint32_t i = 0; i < parallel_worlds; i++) {
+        for (uint32_t i = 0; i < parallels; i++) {
             rngInit[i] = i * 2654435761u + 1u;
         }
 
@@ -82,9 +83,9 @@ struct Gym {
             pool->release();
             device->release();
         }
-    int* actions() { return static_cast<int*>(actionBuffer->contents()); }
+    typename Env::Action* actions() { return static_cast<typename Env::Action*>(actionBuffer->contents()); }
     uint8_t* done() { return static_cast<uint8_t*>(doneBuffer->contents()); }
-    float* obs() { return static_cast<float*>(obsBuffer->contents()); }
+    typename Env::Obs* obs() { return static_cast<typename Env::Obs*>(obsBuffer->contents()); }
 
     void run(std::vector<float>& reward) {
         //command buffers are autoreleased; drain them per step or the pool grows
@@ -99,7 +100,7 @@ struct Gym {
         encoder->setBuffer(rewardBuffer, 0, 3);
         encoder->setBuffer(doneBuffer, 0, 4);
         encoder->setBuffer(rngBuffer, 0, 5);
-        encoder->dispatchThreads(MTL::Size(parallel_worlds, 1, 1), MTL::Size(pipelineState->maxTotalThreadsPerThreadgroup(), 1, 1));
+        encoder->dispatchThreads(MTL::Size(parallels, 1, 1), MTL::Size(pipelineState->maxTotalThreadsPerThreadgroup(), 1, 1));
         
         encoder->endEncoding();
         commandBuffer->commit();

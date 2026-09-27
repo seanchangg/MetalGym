@@ -9,6 +9,8 @@ struct CartPole {
         float thetaDot;
         uint32_t steps;
     };
+    using Action = int;
+    struct Obs { float x, xDot, theta, thetaDot; };
 	static constexpr uint32_t OBS_DIM = 4;
     static constexpr uint32_t ACT_DIM = 2;
     static constexpr const char* KERNEL = "rollout_cartpole";
@@ -28,7 +30,7 @@ int main() {
 	double totalLength = 0;
 	uint64_t episodes = 0;
 	for (int t = 0; t < STEPS; t++) {
-		int* act = gym.actions();
+		CartPole::Action* act = gym.actions();
 		for (uint32_t i = 0; i < N; i++) act[i] = coin(rng) ? 1 : 0;
 		gym.run(reward);
 		uint8_t* done = gym.done();

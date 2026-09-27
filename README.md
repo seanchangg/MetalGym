@@ -14,18 +14,18 @@ numbers, and the host buffers. You write the environment.
 using namespace metal;
 
 struct Environment {
-    struct State {};
+    struct State {};          //per-env state, kept on the GPU between steps
+    struct Action {};       //what the policy outputs
+    struct Obs {};  //what the policy reads
 
     constant static constexpr uint OBS_DIM;
-    constant static constexpr uint ACT_DIM;
+    constant static constexpr uint ACT_DIM; //policy output width
 
     //any additional constants
 
     static void reset(thread State& s, thread uint& rng) {  }
 
-    static void observe(thread const State& s, device float* obs) {  }
-
-    static void step(thread State& s, int action, device float* obs,
+    static void step(thread State& s, Action action, thread Obs& obs,
                      thread float& reward, thread uchar& done) {  }
 };
 
@@ -33,8 +33,8 @@ struct Environment {
 template [[host_name("{kernel_name}")]]
 kernel void rollout<Environment>(
     device Environment::State*,
-    device const int*,
-    device float*,
+    device const Environment::Action*,
+    device Environment::Obs*,
     device float*,
     device uchar*,
     device uint*,
@@ -46,7 +46,9 @@ kernel void rollout<Environment>(
 
 ```cpp
 struct Environment {
-    struct State { };
+    struct State {};         //same fields and order as the Metal State
+    struct Action {};       //same as the Metal Action
+    struct Obs {};  		//same as the Metal Obs
     static constexpr uint32_t OBS_DIM;
     static constexpr uint32_t ACT_DIM;
     static constexpr const char* KERNEL; //make sure this matches the kernel name
@@ -81,14 +83,19 @@ argument. The host writes actions, calls `run`, and reads the results.
 Gym<CartPole> gym(4096);          //4096 environments, one per GPU thread
 std::vector<float> reward(4096);
 
-int* actions = gym.actions();     //one int per env, written before each step
+CartPole::Action* actions = gym.actions(); //one Action per env, written before each step
 for (int i = 0; i < 4096; i++) actions[i] = 0;
 
 gym.run(reward);                  //one step for every env
 
-float* obs = gym.obs();           //OBS_DIM floats per env
+CartPole::Obs* obs = gym.obs();   //one Obs per env
+float* flat = gym.obsFlat();      //the same buffer as OBS_DIM floats per env
 uint8_t* done = gym.done();       //1 when the episode ended on this step
 ```
+
+`State`, `Action`, and `Obs` are plain structs of 4-byte scalars, so the
+host and Metal layouts match. Both sides check that `Obs` is exactly
+`OBS_DIM` floats, which lets the policy read the obs buffer as a flat matrix.
 
 The `done` buffer starts at 1, so the first `run` resets every environment.
 When an environment finishes an episode, the next `run` resets it and steps

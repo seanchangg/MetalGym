@@ -25,6 +25,7 @@ target_link_libraries(metalRL PRIVATE
 # ── Compile the .metal shaders into default.metallib at build time ──
 file(GLOB METAL_SHADERS
         "${CMAKE_SOURCE_DIR}/*.metal"
+        "${CMAKE_SOURCE_DIR}/model/*.metal"
 )
 if(METAL_SHADERS)
     set(AIR_FILES "")
