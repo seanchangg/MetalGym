@@ -1,5 +1,0 @@
----
-triple:          'arm64-apple-darwin'
-binary-path:     '/Users/seanchang/projects/CLionProjects/metalRL/cmake-build-jade/metalRL'
-relocations:     []
-...
