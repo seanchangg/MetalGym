@@ -1,0 +1,1 @@
+/usr/bin/c++ -g -O3 -g -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/metalRL.dir/main.cpp.o -o metalRL  -framework Metal -framework MetalPerformanceShaders -framework Foundation -framework QuartzCore

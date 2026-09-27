@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/Users/seanchang/projects/CLionProjects/metalRL/cmake-build-jade",
+  "command": "/usr/bin/c++  -I/Users/seanchang/.local/include/metal-cpp -g -O3 -g -std=gnu++20 -arch arm64 -o CMakeFiles/metalRL.dir/main.cpp.o -c /Users/seanchang/projects/CLionProjects/metalRL/main.cpp",
+  "file": "/Users/seanchang/projects/CLionProjects/metalRL/main.cpp",
+  "output": "CMakeFiles/metalRL.dir/main.cpp.o"
+}
+]
