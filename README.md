@@ -1,8 +1,8 @@
 # metalRL
 
-A reinforcement learning framework on Apple Metal. Each environment runs one
+The **fastest** reinforcement learning framework on Apple Metal. Each environment runs one
 instance per GPU thread. The framework handles the rollout kernel, the random
-numbers, and the host buffers. You write the environment.
+numbers, and a fused MLP inference. You write the environment.
 
 ## Environment template
 

@@ -127,73 +127,82 @@ kernel void mlpBackwardOne(
 }
 
 
+//dX = dV @ Up^T, one 64 x 64 output tile per threadgroup
 kernel void mlpBackwardTwo (
-    device bfloat* x [[buffer(0)]],
     device bfloat* dX [[buffer(1)]],
     device bfloat* dV [[buffer(2)]],
     device bfloat* upproj [[buffer(3)]],
-    device bfloat* dUp [[buffer(4)]],
-    device bfloat* v [[buffer(5)]],
-    device bfloat* dZ [[buffer(6)]],
-    device bfloat* dDp [[buffer(7)]],
     constant mlpParams& p [[buffer(8)]],
-    uint gid [[threadgroup_position_in_grid]]
+    uint2 gid [[threadgroup_position_in_grid]]
 ) {
-    //two independent tilings share this 1-D grid: dUp/dDp strips are indexed
-    //by hidden column tile (N*S/64 of them), the dX output by M x N tile
-    //((M/64)*(N/64) of them). The counts only coincide when S*N == M*N/64*64,
-    //so each half is guarded by its own bound and the host dispatches the max.
-    uint hidden_tiles = p.N * p.S / TILE_M;
-    uint dx_tiles = (p.M / TILE_M) * (p.N / TILE_N);
-    uint tile_row = gid % (p.M / TILE_M);
-    uint tile_col = gid / (p.M / TILE_M);
-    uint global_row_start = TILE_M * tile_row;
-    uint global_col_start = TILE_N * tile_col;
-    uint hidden_col_start = TILE_M * gid;
-
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Xt (x, dextents<int32_t, 2>{p.N, p.M});
+    uint global_row_start = TILE_M * gid.x;
+    uint global_col_start = TILE_N * gid.y;
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dXt (dX, dextents<int32_t, 2>{p.N, p.M});
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Upt (upproj, dextents<int32_t, 2>{p.N*p.S, p.N});
-
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dVt (dV, dextents<int32_t, 2>{p.N*p.S, p.M});
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dUppt (dUp, dextents<int32_t, 2>{p.N*p.S, p.N});
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Vt (v, dextents<int32_t, 2>{p.N*p.S, p.M});
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dZt (dZ, dextents<int32_t, 2>{p.N, p.M});
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dDpt (dDp, dextents<int32_t, 2>{p.N, p.N*p.S});
-
-    constexpr auto desc_dup = matmul2d_descriptor(
-            N_EMBED, // X^T @ dV tile: (N x M) @ (M x 64)
-            TILE_M,
-            static_cast<int>(dynamic_extent),
-            true, false, false);
-    constexpr auto desc_ddp = matmul2d_descriptor(
-            TILE_M, // V tile^T @ dZ: (64 x M) @ (M x N)
-            N_EMBED,
-            static_cast<int>(dynamic_extent),
-            true, false, false);
     constexpr auto desc_dx = matmul2d_descriptor(
         TILE_M,
         TILE_N,
         static_cast<int>(dynamic_extent),
         false, true, false); //dV @ Up^T
-
     matmul2d<desc_dx, execution_simdgroups<4>> dX_op;
+    auto mdX = dXt.slice(global_col_start, global_row_start);
+    auto mdV = dVt.slice(0, global_row_start);
+    auto mUp = Upt.slice(0, global_col_start);
+    dX_op.run(mdV, mUp, mdX);
+}
+
+//Weight gradients reduce over the batch, so the batch is split into chunks of
+//p.chunkRows rows and each threadgroup writes one float partial:
+//  dUpPart[chunk] = X_chunk^T @ dV_chunk      (N x hidden)
+//  dDpPart[chunk] = V_chunk^T  @ dZ_chunk     (hidden x N)
+//gid.x = hidden column tile, gid.y = chunk. reducePartials sums the chunks.
+struct mlpWeightParams {
+    uint M;
+    uint N;
+    uint S;
+    uint chunkRows;
+};
+
+kernel void mlpBackwardWeights (
+    device bfloat* x [[buffer(0)]],
+    device bfloat* dV [[buffer(1)]],
+    device bfloat* v [[buffer(2)]],
+    device bfloat* dZ [[buffer(3)]],
+    device float* dUpPart [[buffer(4)]],
+    device float* dDpPart [[buffer(5)]],
+    constant mlpWeightParams& p [[buffer(6)]],
+    uint2 gid [[threadgroup_position_in_grid]]
+) {
+    const uint H = p.N * p.S;
+    const uint tile = gid.x;
+    const uint chunk = gid.y;
+    const uint row0 = chunk * p.chunkRows;
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Xc (x + row0 * p.N, dextents<int32_t, 2>{p.N, p.chunkRows});
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dVc (dV + row0 * H, dextents<int32_t, 2>{H, p.chunkRows});
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Vc (v + row0 * H, dextents<int32_t, 2>{H, p.chunkRows});
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dZc (dZ + row0 * p.N, dextents<int32_t, 2>{p.N, p.chunkRows});
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> dUpP (dUpPart + chunk * p.N * H, dextents<int32_t, 2>{H, p.N});
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> dDpP (dDpPart + chunk * p.N * H, dextents<int32_t, 2>{p.N, H});
+
+    constexpr auto desc_dup = matmul2d_descriptor(
+            N_EMBED, // X_chunk^T @ dV tile: (N x rows) @ (rows x 64)
+            TILE_M,
+            static_cast<int>(dynamic_extent),
+            true, false, false);
+    constexpr auto desc_ddp = matmul2d_descriptor(
+            TILE_M, // V tile^T @ dZ: (64 x rows) @ (rows x N)
+            N_EMBED,
+            static_cast<int>(dynamic_extent),
+            true, false, false);
     matmul2d<desc_dup, execution_simdgroups<4>> dUp_op;
     matmul2d<desc_ddp, execution_simdgroups<4>> dDp_op;
 
-    if (gid < hidden_tiles) {
-        auto mdV = dVt.slice(hidden_col_start, 0);
-        auto mdUp = dUppt.slice(hidden_col_start, 0);
-        dUp_op.run(Xt, mdV, mdUp);
+    auto mdV = dVc.slice(tile * TILE_M, 0);
+    auto mdUp = dUpP.slice(tile * TILE_M, 0);
+    dUp_op.run(Xc, mdV, mdUp);
 
-        auto mV = Vt.slice(hidden_col_start, 0);
-        auto mdDp = dDpt.slice(0, hidden_col_start);
-        dDp_op.run(mV, dZt, mdDp);
-    }
-    if (gid < dx_tiles) {
-        auto mdX = dXt.slice(global_col_start, global_row_start);
-        auto mdV = dVt.slice(0, global_row_start);
-        auto mUp = Upt.slice(0, global_col_start);
-        dX_op.run(mdV, mUp, mdX);
-    }
+    auto mV = Vc.slice(tile * TILE_M, 0);
+    auto mdDp = dDpP.slice(0, tile * TILE_M);
+    dDp_op.run(mV, dZc, mdDp);
 }

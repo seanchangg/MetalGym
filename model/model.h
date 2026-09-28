@@ -24,6 +24,28 @@ struct InputParams {
     uint32_t inDim;
     uint32_t outDim;
 };
+struct InputBackwardParams {
+    uint32_t rows;
+    uint32_t inDim;
+    uint32_t outDim;
+    uint32_t chunkRows;
+};
+struct mlpWeightParams {
+    uint32_t M;
+    uint32_t N;
+    uint32_t S;
+    uint32_t chunkRows;
+};
+struct LinearWeightParams {
+    uint32_t M;
+    uint32_t N;
+    uint32_t K;
+    uint32_t chunkRows;
+};
+struct ReduceParams {
+    uint32_t len;
+    uint32_t chunks;
+};
 struct LayernormParams {
     uint32_t rows;
     uint32_t cols;
@@ -68,6 +90,7 @@ struct NormalizeParams {
 };
 struct AdamParams {
     uint32_t count;
+    uint32_t floatCount;
     float lr;
     float beta1 = 0.9f;
     float beta2 = 0.999f;
@@ -95,25 +118,30 @@ struct Model {
     static constexpr uint32_t HEAD_DIM = 64; //one linear tile: logits, value, zero padding
     static_assert(Env::ACT_DIM + 1 <= HEAD_DIM, "ACT_DIM + value must fit one 64-wide tile");
 
+    //a byte range inside one of the arenas
+    struct Slice {
+        MTL::Buffer* buffer = nullptr;
+        size_t offset = 0;
+    };
     struct LayernormBuffers {
-        MTL::Buffer* gammaBuffer;
-        MTL::Buffer* betaBuffer;
+        Slice gamma;
+        Slice beta;
         MTL::Buffer* xnormBuffer;
         MTL::Buffer* stdevBuffer;
         MTL::Buffer* outBuffer;
-        MTL::Buffer* dGammaBuffer;
-        MTL::Buffer* dBetaBuffer;
+        Slice dGamma;
+        Slice dBeta;
     };
     struct BlockBuffers {
         LayernormBuffers ln;
-        MTL::Buffer* upprojBuffer;
-        MTL::Buffer* downprojBuffer;
+        Slice upproj;
+        Slice downproj;
         MTL::Buffer* mlpVBuffer;
         MTL::Buffer* mlpMaskBuffer;
         MTL::Buffer* mlpOutBuffer;
         MTL::Buffer* residualBuffer;
-        MTL::Buffer* dUpBuffer;
-        MTL::Buffer* dDpBuffer;
+        Slice dUp;
+        Slice dDp;
     };
 
     Gym<Env>& gym;
@@ -128,6 +156,9 @@ struct Model {
     MTL::ComputePipelineState* mlpFwdTwoPipeline;
     MTL::ComputePipelineState* mlpBwdOnePipeline;
     MTL::ComputePipelineState* mlpBwdTwoPipeline;
+    MTL::ComputePipelineState* mlpBwdWeightsPipeline;
+    MTL::ComputePipelineState* linearBwdDwPipeline;
+    MTL::ComputePipelineState* reducePipeline;
     MTL::ComputePipelineState* linearFwdPipeline;
     MTL::ComputePipelineState* linearBwdPipeline;
     MTL::ComputePipelineState* policyLossPipeline;
@@ -137,9 +168,6 @@ struct Model {
     MTL::ComputePipelineState* residualAddPipeline;
     MTL::ComputePipelineState* gradNormPipeline;
     MTL::ComputePipelineState* stepPipeline;
-    MTL::ComputePipelineState* gatherFloatPipeline;
-    MTL::ComputePipelineState* gatherBfloatPipeline;
-    MTL::ComputePipelineState* scatterPipeline;
 
     uint32_t parallels;
     uint32_t horizon;
@@ -151,6 +179,8 @@ struct Model {
     uint32_t tileRows;
     uint32_t tileCols;
     uint32_t activationCount;
+    uint32_t chunks;    //batch chunks for the weight-gradient reductions
+    uint32_t chunkRows; //parallels / chunks, a multiple of 64
     static constexpr uint32_t tileM = 64;
     static constexpr uint32_t tileN = 64;
     static constexpr uint32_t simdGroups = 4;
@@ -163,6 +193,9 @@ struct Model {
     float lambda = 0.95f;
 
     InputParams inputParams;
+    InputBackwardParams inputBackwardParams;
+    mlpWeightParams mlpWeightParameters;
+    LinearWeightParams linearWeightParams;
     LayernormParams layernormParams;
     mlpParams mlpParameters;
     LinearParams linearParams;
@@ -191,36 +224,48 @@ struct Model {
     std::vector<uint32_t> slotOrder;
     std::mt19937 hostRng;
 
-    MTL::Buffer* inWBuffer;
-    MTL::Buffer* inBBuffer;
+    Slice inW;
+    Slice inB;
     MTL::Buffer* inputBuffer;
-    MTL::Buffer* dInWBuffer;
-    MTL::Buffer* dInBBuffer;
+    Slice dInW;
+    Slice dInB;
 
     std::vector<BlockBuffers> blocks;
 
     LayernormBuffers lnFinal;
-    MTL::Buffer* linearWBuffer;
+    Slice linearW;
     MTL::Buffer* logitsBuffer;
     MTL::Buffer* dLogitsBuffer;
-    MTL::Buffer* dLinearWBuffer;
+    Slice dLinearW;
     MTL::Buffer* statsBuffer;
 
     MTL::Buffer* dStreamBuffer;
     MTL::Buffer* dBranchBuffer;
     MTL::Buffer* dXnormBuffer;
     MTL::Buffer* dMlpVBuffer;
+    MTL::Buffer* dUpPartBuffer; //chunks x embedDim x hiddenDim float
+    MTL::Buffer* dDpPartBuffer;
+    MTL::Buffer* dWPartBuffer;  //chunks x embedDim x HEAD_DIM float
 
-    struct FlatCopyParams { uint32_t count; uint32_t offset; };
-    std::vector<std::vector<__bf16>> optWeights;
-    std::vector<MTL::Buffer*> optWeightBuffers;
-    std::vector<MTL::Buffer*> optGradBuffers;
-    std::vector<bool> optGradIsFloat;
-    std::vector<size_t> optOffsets;
+    //parameters: float-grad params first, then bf16-grad params, each aligned
+    //to 128 elements. The flat master, momentum, variance, and weight arena
+    //share these element offsets.
+    struct ParamSpec {
+        size_t count;
+        bool gradIsFloat;
+        std::vector<__bf16> init;
+        Slice* weight;
+        Slice* grad;
+        size_t offset = 0;
+    };
+    std::vector<ParamSpec> params;
     size_t optCount = 0;
+    size_t optFloatCount = 0;
     float stepCounter = 0.0f;
-    MTL::Buffer* parameterBuffer;
-    MTL::Buffer* gradientBuffer;
+    MTL::Buffer* weightArena;     //bf16, read by the kernels
+    MTL::Buffer* gradFloatArena;  //float accumulators
+    MTL::Buffer* gradBfArena;     //bf16 matmul outputs
+    MTL::Buffer* parameterBuffer; //float master
     MTL::Buffer* momentumBuffer;
     MTL::Buffer* varianceBuffer;
     MTL::Buffer* normSqBuffer;
@@ -249,6 +294,14 @@ struct Model {
                       << " from model/config.h\n";
             std::exit(1);
         }
+        chunks = 1;
+        for (uint32_t c = 16; c >= 1; --c) {
+            if (tileRows % c == 0) { chunks = c; break; }
+        }
+        chunkRows = parallels / chunks;
+        inputBackwardParams = InputBackwardParams{parallels, Env::OBS_DIM, embedDim, chunkRows};
+        mlpWeightParameters = mlpWeightParams{parallels, embedDim, mlpScale, chunkRows};
+        linearWeightParams = LinearWeightParams{parallels, HEAD_DIM, embedDim, chunkRows};
         device = gym.device;
         commandQueue = gym.commandQueue;
         MTL::Library* library = device->newDefaultLibrary();
@@ -261,6 +314,9 @@ struct Model {
         mlpFwdTwoPipeline = makePipeline(library, "mlpForwardTwo");
         mlpBwdOnePipeline = makePipeline(library, "mlpBackwardOne");
         mlpBwdTwoPipeline = makePipeline(library, "mlpBackwardTwo");
+        mlpBwdWeightsPipeline = makePipeline(library, "mlpBackwardWeights");
+        linearBwdDwPipeline = makePipeline(library, "linearBackwardDw");
+        reducePipeline = makePipeline(library, "reducePartials");
         linearFwdPipeline = makePipeline(library, "linearForward");
         linearBwdPipeline = makePipeline(library, "linearBackward");
         policyLossPipeline = makePipeline(library, "policyLossBackward");
@@ -270,9 +326,6 @@ struct Model {
         residualAddPipeline = makePipeline(library, "residualAdd");
         gradNormPipeline = makePipeline(library, "gradNormSq");
         stepPipeline = makePipeline(library, "adamStep");
-        gatherFloatPipeline = makePipeline(library, "gatherGradFloat");
-        gatherBfloatPipeline = makePipeline(library, "gatherGradBfloat");
-        scatterPipeline = makePipeline(library, "scatterWeight");
         library->release();
 
         valueBuffer = newSharedBuffer(rowFloatBytes);
@@ -293,36 +346,29 @@ struct Model {
         for (uint32_t t = 0; t < horizon; t++) slotOrder[t] = t;
         hostRng.seed(seed);
 
-        inWBuffer = newSharedBuffer((size_t)Env::OBS_DIM * embedDim * sizeof(__bf16));
-        inBBuffer = newSharedBuffer((size_t)embedDim * sizeof(__bf16));
         inputBuffer = newSharedBuffer(activationBytes);
-        dInWBuffer = newSharedBuffer((size_t)Env::OBS_DIM * embedDim * sizeof(float));
-        dInBBuffer = newSharedBuffer((size_t)embedDim * sizeof(float));
 
         blocks.resize(nLayers);
         for (BlockBuffers& block : blocks) {
             allocLayernorm(block.ln);
-            block.upprojBuffer = newSharedBuffer((size_t)embedDim * hiddenDim * sizeof(__bf16));
-            block.downprojBuffer = newSharedBuffer((size_t)hiddenDim * embedDim * sizeof(__bf16));
             block.mlpVBuffer = newSharedBuffer(hiddenBytes);
             block.mlpMaskBuffer = newSharedBuffer((size_t)parallels * hiddenDim * sizeof(uint8_t));
             block.mlpOutBuffer = newSharedBuffer(activationBytes);
             block.residualBuffer = newSharedBuffer(activationBytes);
-            block.dUpBuffer = newSharedBuffer((size_t)embedDim * hiddenDim * sizeof(__bf16));
-            block.dDpBuffer = newSharedBuffer((size_t)hiddenDim * embedDim * sizeof(__bf16));
         }
 
         allocLayernorm(lnFinal);
-        linearWBuffer = newSharedBuffer((size_t)embedDim * HEAD_DIM * sizeof(__bf16));
         logitsBuffer = newSharedBuffer((size_t)parallels * HEAD_DIM * sizeof(__bf16));
         dLogitsBuffer = newSharedBuffer((size_t)parallels * HEAD_DIM * sizeof(__bf16));
-        dLinearWBuffer = newSharedBuffer((size_t)embedDim * HEAD_DIM * sizeof(__bf16));
         statsBuffer = newSharedBuffer((size_t)parallels * 5 * sizeof(float));
 
         dStreamBuffer = newSharedBuffer(activationBytes);
         dBranchBuffer = newSharedBuffer(activationBytes);
         dXnormBuffer = newSharedBuffer(activationBytes);
         dMlpVBuffer = newSharedBuffer(hiddenBytes);
+        dUpPartBuffer = newSharedBuffer((size_t)chunks * embedDim * hiddenDim * sizeof(float));
+        dDpPartBuffer = newSharedBuffer((size_t)chunks * embedDim * hiddenDim * sizeof(float));
+        dWPartBuffer = newSharedBuffer((size_t)chunks * embedDim * HEAD_DIM * sizeof(float));
 
         std::mt19937 rng(seed);
         auto normal = [&](std::vector<__bf16>& weight, float stdev) {
@@ -332,22 +378,20 @@ struct Model {
         auto constant = [](std::vector<__bf16>& weight, float value) {
             std::fill(weight.begin(), weight.end(), (__bf16)value);
         };
-        normal(addParam((size_t)Env::OBS_DIM * embedDim, inWBuffer, dInWBuffer, true),
-               1.0f / std::sqrt((float)Env::OBS_DIM));
-        constant(addParam((size_t)embedDim, inBBuffer, dInBBuffer, true), 0.0f);
+        normal(addParam((size_t)Env::OBS_DIM * embedDim, true, inW, dInW), 1.0f / std::sqrt((float)Env::OBS_DIM));
+        constant(addParam((size_t)embedDim, true, inB, dInB), 0.0f);
         for (uint32_t n = 0; n < nLayers; ++n) {
             BlockBuffers& block = blocks[n];
-            constant(addParam((size_t)embedDim, block.ln.gammaBuffer, block.ln.dGammaBuffer, true), 1.0f);
-            constant(addParam((size_t)embedDim, block.ln.betaBuffer, block.ln.dBetaBuffer, true), 0.0f);
-            normal(addParam((size_t)embedDim * hiddenDim, block.upprojBuffer, block.dUpBuffer, false),
-                   std::sqrt(2.0f / (float)embedDim));
-            normal(addParam((size_t)hiddenDim * embedDim, block.downprojBuffer, block.dDpBuffer, false),
+            constant(addParam((size_t)embedDim, true, block.ln.gamma, block.ln.dGamma), 1.0f);
+            constant(addParam((size_t)embedDim, true, block.ln.beta, block.ln.dBeta), 0.0f);
+            normal(addParam((size_t)embedDim * hiddenDim, false, block.upproj, block.dUp), std::sqrt(2.0f / (float)embedDim));
+            normal(addParam((size_t)hiddenDim * embedDim, false, block.downproj, block.dDp),
                    1.0f / std::sqrt((float)hiddenDim) / std::sqrt((float)nLayers));
         }
-        constant(addParam((size_t)embedDim, lnFinal.gammaBuffer, lnFinal.dGammaBuffer, true), 1.0f);
-        constant(addParam((size_t)embedDim, lnFinal.betaBuffer, lnFinal.dBetaBuffer, true), 0.0f);
+        constant(addParam((size_t)embedDim, true, lnFinal.gamma, lnFinal.dGamma), 1.0f);
+        constant(addParam((size_t)embedDim, true, lnFinal.beta, lnFinal.dBeta), 0.0f);
         {
-            std::vector<__bf16>& head = addParam((size_t)embedDim * HEAD_DIM, linearWBuffer, dLinearWBuffer, false);
+            std::vector<__bf16>& head = addParam((size_t)embedDim * HEAD_DIM, false, linearW, dLinearW);
             std::normal_distribution<float> policyDist(0.0f, 0.01f);
             std::normal_distribution<float> valueDist(0.0f, 1.0f / std::sqrt((float)embedDim));
             for (uint32_t k = 0; k < embedDim; ++k) {
@@ -360,25 +404,38 @@ struct Model {
             }
         }
 
+        //layout: float-grad params, then bf16-grad params
+        const size_t align = 128;
         size_t total = 0;
-        for (std::vector<__bf16>& weight : optWeights) {
-            optOffsets.push_back(total);
-            total += weight.size();
+        for (int pass = 0; pass < 2; ++pass) {
+            for (ParamSpec& spec : params) {
+                if (spec.gradIsFloat != (pass == 0)) continue;
+                spec.offset = total;
+                total += (spec.count + align - 1) / align * align;
+            }
+            if (pass == 0) optFloatCount = total;
         }
         optCount = total;
+        weightArena = newSharedBuffer(optCount * sizeof(__bf16));
+        gradFloatArena = newSharedBuffer(optFloatCount * sizeof(float));
+        gradBfArena = newSharedBuffer((optCount - optFloatCount) * sizeof(__bf16));
         parameterBuffer = newSharedBuffer(optCount * sizeof(float));
-        gradientBuffer = newSharedBuffer(optCount * sizeof(float));
         momentumBuffer = newSharedBuffer(optCount * sizeof(float));
         varianceBuffer = newSharedBuffer(optCount * sizeof(float));
         normSqBuffer = newSharedBuffer(4 * sizeof(float));
 
-        auto* masterOut = static_cast<float*>(parameterBuffer->contents());
-        for (size_t i = 0; i < optWeights.size(); ++i) {
-            std::transform(optWeights[i].begin(), optWeights[i].end(), masterOut + optOffsets[i],
-                           [](__bf16 x) { return (float)x; });
-            std::memcpy(optWeightBuffers[i]->contents(), optWeights[i].data(), optWeights[i].size() * sizeof(__bf16));
+        auto* master = static_cast<float*>(parameterBuffer->contents());
+        auto* weights = static_cast<__bf16*>(weightArena->contents());
+        std::fill(master, master + optCount, 0.0f);
+        std::fill(weights, weights + optCount, (__bf16)0.0f);
+        for (ParamSpec& spec : params) {
+            std::transform(spec.init.begin(), spec.init.end(), master + spec.offset, [](__bf16 x) { return (float)x; });
+            std::copy(spec.init.begin(), spec.init.end(), weights + spec.offset);
+            *spec.weight = Slice{weightArena, spec.offset * sizeof(__bf16)};
+            *spec.grad = spec.gradIsFloat ? Slice{gradFloatArena, spec.offset * sizeof(float)}
+                                          : Slice{gradBfArena, (spec.offset - optFloatCount) * sizeof(__bf16)};
+            spec.init.clear();
         }
-        std::memset(gradientBuffer->contents(), 0, optCount * sizeof(float));
         std::memset(momentumBuffer->contents(), 0, optCount * sizeof(float));
         std::memset(varianceBuffer->contents(), 0, optCount * sizeof(float));
     }
@@ -415,13 +472,9 @@ struct Model {
         return device->newBuffer(bytes, MTL::ResourceStorageModeShared);
     }
     void allocLayernorm(LayernormBuffers& ln) {
-        ln.gammaBuffer = newSharedBuffer((size_t)embedDim * sizeof(__bf16));
-        ln.betaBuffer = newSharedBuffer((size_t)embedDim * sizeof(__bf16));
         ln.xnormBuffer = newSharedBuffer(activationBytes);
         ln.stdevBuffer = newSharedBuffer(rowFloatBytes);
         ln.outBuffer = newSharedBuffer(activationBytes);
-        ln.dGammaBuffer = newSharedBuffer(gammaFloatBytes);
-        ln.dBetaBuffer = newSharedBuffer(gammaFloatBytes);
     }
     MTL::ComputeCommandEncoder* makeEncoder(MTL::CommandBuffer* commandBuffer,
                                             MTL::ComputePipelineState* pipeline) {
@@ -438,10 +491,18 @@ struct Model {
                       << (error ? error->localizedDescription()->utf8String() : "unknown") << "\n";
         }
     }
-    static void encodeZero(MTL::CommandBuffer* commandBuffer, MTL::Buffer* buffer, size_t bytes) {
-        MTL::BlitCommandEncoder* blit = commandBuffer->blitCommandEncoder();
-        blit->fillBuffer(buffer, NS::Range::Make(0, bytes), 0);
-        blit->endEncoding();
+    static void bind(MTL::ComputeCommandEncoder* encoder, const Slice& slice, uint32_t index) {
+        encoder->setBuffer(slice.buffer, slice.offset, index);
+    }
+    //out = bf16(sum of chunk partials)
+    void encodeReduce(MTL::CommandBuffer* commandBuffer, MTL::Buffer* part, const Slice& out, uint32_t len) {
+        ReduceParams reduceParams{len, chunks};
+        MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, reducePipeline);
+        encoder->setBuffer(part, 0, 0);
+        bind(encoder, out, 1);
+        encoder->setBytes(&reduceParams, sizeof(reduceParams), 2);
+        encoder->dispatchThreads(MTL::Size(len, 1, 1), MTL::Size(256, 1, 1));
+        encoder->endEncoding();
     }
     static void encodeCopy(MTL::CommandBuffer* commandBuffer, MTL::Buffer* src, size_t srcOffset,
                            MTL::Buffer* dst, size_t dstOffset, size_t bytes) {
@@ -467,8 +528,8 @@ struct Model {
         encoder->setBuffer(xBuffer, 0, 0);
         encoder->setBuffer(ln.xnormBuffer, 0, 1);
         encoder->setBuffer(ln.outBuffer, 0, 2);
-        encoder->setBuffer(ln.gammaBuffer, 0, 3);
-        encoder->setBuffer(ln.betaBuffer, 0, 4);
+        bind(encoder, ln.gamma, 3);
+        bind(encoder, ln.beta, 4);
         encoder->setBuffer(ln.stdevBuffer, 0, 5);
         encoder->setBytes(&layernormParams, sizeof(layernormParams), 6);
         encoder->dispatchThreadgroups(MTL::Size(layernormParams.rows, 1, 1), MTL::Size(layernormParams.group_size, 1, 1));
@@ -478,11 +539,11 @@ struct Model {
         MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, layernormBwdPipeline);
         encoder->setBuffer(dZBuffer, 0, 0);
         encoder->setBuffer(ln.xnormBuffer, 0, 1);
-        encoder->setBuffer(ln.gammaBuffer, 0, 2);
+        bind(encoder, ln.gamma, 2);
         encoder->setBuffer(ln.stdevBuffer, 0, 3);
         encoder->setBuffer(dXnormBuffer, 0, 5);
-        encoder->setBuffer(ln.dGammaBuffer, 0, 6);
-        encoder->setBuffer(ln.dBetaBuffer, 0, 7);
+        bind(encoder, ln.dGamma, 6);
+        bind(encoder, ln.dBeta, 7);
         encoder->setBytes(&layernormParams, sizeof(layernormParams), 8);
         encoder->dispatchThreadgroups(MTL::Size(layernormParams.rows, 1, 1), MTL::Size(layernormParams.group_size, 1, 1));
         encoder->endEncoding();
@@ -492,8 +553,8 @@ struct Model {
         {
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, inputFwdPipeline);
             encoder->setBuffer(obsBuffer, obsByteOffset, 0);
-            encoder->setBuffer(inWBuffer, 0, 1);
-            encoder->setBuffer(inBBuffer, 0, 2);
+            bind(encoder, inW, 1);
+            bind(encoder, inB, 2);
             encoder->setBuffer(inputBuffer, 0, 3);
             encoder->setBytes(&inputParams, sizeof(inputParams), 4);
             encoder->dispatchThreads(MTL::Size(embedDim, parallels, 1),
@@ -509,7 +570,7 @@ struct Model {
             {
                 MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, mlpFwdOnePipeline);
                 encoder->setBuffer(block.ln.outBuffer, 0, 0);
-                encoder->setBuffer(block.upprojBuffer, 0, 1);
+                bind(encoder, block.upproj, 1);
                 encoder->setBuffer(block.mlpVBuffer, 0, 2);
                 encoder->setBuffer(block.mlpMaskBuffer, 0, 3);
                 encoder->setBytes(&mlpParameters, sizeof(mlpParameters), 4);
@@ -518,7 +579,7 @@ struct Model {
             }
             {
                 MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, mlpFwdTwoPipeline);
-                encoder->setBuffer(block.downprojBuffer, 0, 0);
+                bind(encoder, block.downproj, 0);
                 encoder->setBuffer(block.mlpVBuffer, 0, 1);
                 encoder->setBuffer(block.mlpOutBuffer, 0, 2);
                 encoder->setBytes(&mlpParameters, sizeof(mlpParameters), 3);
@@ -533,7 +594,7 @@ struct Model {
         {
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, linearFwdPipeline);
             encoder->setBuffer(lnFinal.outBuffer, 0, 0);
-            encoder->setBuffer(linearWBuffer, 0, 1);
+            bind(encoder, linearW, 1);
             encoder->setBuffer(logitsBuffer, 0, 2);
             encoder->setBytes(&linearParams, sizeof(linearParams), 3);
             encoder->dispatchThreadgroups(MTL::Size(tileRows, HEAD_DIM / tileN, 1), MTL::Size(32 * simdGroups, 1, 1));
@@ -664,27 +725,33 @@ struct Model {
     }
 
     void encodeBackward(MTL::CommandBuffer* commandBuffer, MTL::Buffer* obsBuffer, size_t obsByteOffset) {
-        encodeZero(commandBuffer, dLinearWBuffer, (size_t)embedDim * HEAD_DIM * sizeof(__bf16));
-        encodeZero(commandBuffer, lnFinal.dGammaBuffer, gammaFloatBytes);
-        encodeZero(commandBuffer, lnFinal.dBetaBuffer, gammaFloatBytes);
-        for (BlockBuffers& block : blocks) {
-            encodeZero(commandBuffer, block.ln.dGammaBuffer, gammaFloatBytes);
-            encodeZero(commandBuffer, block.ln.dBetaBuffer, gammaFloatBytes);
-            encodeZero(commandBuffer, block.dUpBuffer, (size_t)embedDim * hiddenDim * sizeof(__bf16));
-            encodeZero(commandBuffer, block.dDpBuffer, (size_t)hiddenDim * embedDim * sizeof(__bf16));
+        {
+            MTL::BlitCommandEncoder* blit = commandBuffer->blitCommandEncoder();
+            blit->fillBuffer(gradFloatArena, NS::Range::Make(0, optFloatCount * sizeof(float)), 0);
+            blit->fillBuffer(gradBfArena, NS::Range::Make(0, (optCount - optFloatCount) * sizeof(__bf16)), 0);
+            blit->fillBuffer(normSqBuffer, NS::Range::Make(0, 4 * sizeof(float)), 0);
+            blit->endEncoding();
         }
 
         {
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, linearBwdPipeline);
-            encoder->setBuffer(lnFinal.outBuffer, 0, 0);
-            encoder->setBuffer(linearWBuffer, 0, 1);
+            bind(encoder, linearW, 1);
             encoder->setBuffer(dLogitsBuffer, 0, 2);
             encoder->setBuffer(dStreamBuffer, 0, 3);
-            encoder->setBuffer(dLinearWBuffer, 0, 4);
             encoder->setBytes(&linearParams, sizeof(linearParams), 5);
             encoder->dispatchThreadgroups(MTL::Size(tileRows, 1, 1), MTL::Size(32 * simdGroups, 1, 1));
             encoder->endEncoding();
         }
+        {
+            MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, linearBwdDwPipeline);
+            encoder->setBuffer(lnFinal.outBuffer, 0, 0);
+            encoder->setBuffer(dLogitsBuffer, 0, 1);
+            encoder->setBuffer(dWPartBuffer, 0, 2);
+            encoder->setBytes(&linearWeightParams, sizeof(linearWeightParams), 3);
+            encoder->dispatchThreadgroups(MTL::Size(HEAD_DIM / tileN, chunks, 1), MTL::Size(32 * simdGroups, 1, 1));
+            encoder->endEncoding();
+        }
+        encodeReduce(commandBuffer, dWPartBuffer, dLinearW, embedDim * HEAD_DIM);
         encodeLayernormBackward(commandBuffer, lnFinal, dStreamBuffer);
 
         for (int n = (int)nLayers - 1; n >= 0; --n) {
@@ -692,7 +759,7 @@ struct Model {
 
             {
                 MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, mlpBwdOnePipeline);
-                encoder->setBuffer(block.downprojBuffer, 0, 1);
+                bind(encoder, block.downproj, 1);
                 encoder->setBuffer(block.mlpMaskBuffer, 0, 2);
                 encoder->setBuffer(dStreamBuffer, 0, 3);
                 encoder->setBuffer(dMlpVBuffer, 0, 5);
@@ -701,17 +768,26 @@ struct Model {
                 encoder->endEncoding();
             }
             {
-                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, mlpBwdTwoPipeline);
+                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, mlpBwdWeightsPipeline);
                 encoder->setBuffer(block.ln.outBuffer, 0, 0);
+                encoder->setBuffer(dMlpVBuffer, 0, 1);
+                encoder->setBuffer(block.mlpVBuffer, 0, 2);
+                encoder->setBuffer(dStreamBuffer, 0, 3);
+                encoder->setBuffer(dUpPartBuffer, 0, 4);
+                encoder->setBuffer(dDpPartBuffer, 0, 5);
+                encoder->setBytes(&mlpWeightParameters, sizeof(mlpWeightParameters), 6);
+                encoder->dispatchThreadgroups(MTL::Size(hiddenDim / tileM, chunks, 1), MTL::Size(32 * simdGroups, 1, 1));
+                encoder->endEncoding();
+            }
+            encodeReduce(commandBuffer, dUpPartBuffer, block.dUp, embedDim * hiddenDim);
+            encodeReduce(commandBuffer, dDpPartBuffer, block.dDp, embedDim * hiddenDim);
+            {
+                MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, mlpBwdTwoPipeline);
                 encoder->setBuffer(dBranchBuffer, 0, 1);
                 encoder->setBuffer(dMlpVBuffer, 0, 2);
-                encoder->setBuffer(block.upprojBuffer, 0, 3);
-                encoder->setBuffer(block.dUpBuffer, 0, 4);
-                encoder->setBuffer(block.mlpVBuffer, 0, 5);
-                encoder->setBuffer(dStreamBuffer, 0, 6);
-                encoder->setBuffer(block.dDpBuffer, 0, 7);
+                bind(encoder, block.upproj, 3);
                 encoder->setBytes(&mlpParameters, sizeof(mlpParameters), 8);
-                encoder->dispatchThreadgroups(MTL::Size(std::max(hiddenDim / tileM, tileRows * tileCols), 1, 1), MTL::Size(32 * simdGroups, 1, 1));
+                encoder->dispatchThreadgroups(MTL::Size(tileRows, tileCols, 1), MTL::Size(32 * simdGroups, 1, 1));
                 encoder->endEncoding();
             }
             encodeLayernormBackward(commandBuffer, block.ln, dBranchBuffer);
@@ -722,68 +798,49 @@ struct Model {
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, inputBwdPipeline);
             encoder->setBuffer(obsBuffer, obsByteOffset, 0);
             encoder->setBuffer(dStreamBuffer, 0, 1);
-            encoder->setBuffer(dInWBuffer, 0, 2);
-            encoder->setBuffer(dInBBuffer, 0, 3);
-            encoder->setBytes(&inputParams, sizeof(inputParams), 4);
-            encoder->dispatchThreads(MTL::Size((Env::OBS_DIM + 1) * embedDim, 1, 1), MTL::Size(256, 1, 1));
+            bind(encoder, dInW, 2);
+            bind(encoder, dInB, 3);
+            encoder->setBytes(&inputBackwardParams, sizeof(inputBackwardParams), 4);
+            encoder->dispatchThreads(MTL::Size((Env::OBS_DIM + 1) * embedDim, chunks, 1), MTL::Size(256, 1, 1));
             encoder->endEncoding();
         }
     }
 
-    std::vector<__bf16>& addParam(size_t count, MTL::Buffer* weightBuffer, MTL::Buffer* gradBuffer, bool gradIsFloat) {
-        optWeights.emplace_back(count, (__bf16)0.0f);
-        optWeightBuffers.push_back(weightBuffer);
-        optGradBuffers.push_back(gradBuffer);
-        optGradIsFloat.push_back(gradIsFloat);
-        return optWeights.back();
+    std::vector<__bf16>& addParam(size_t count, bool gradIsFloat, Slice& weight, Slice& grad) {
+        params.push_back(ParamSpec{count, gradIsFloat, std::vector<__bf16>(count, (__bf16)0.0f), &weight, &grad});
+        return params.back().init;
     }
+    //grad norm over both arenas, then Adam on the float master, which also
+    //writes the bf16 weight arena the next forward reads
     void encodeStep(MTL::CommandBuffer* commandBuffer) {
         stepCounter += 1.0f;
         AdamParams adamParams;
         adamParams.count = (uint32_t)optCount;
+        adamParams.floatCount = (uint32_t)optFloatCount;
         adamParams.lr = lr;
         adamParams.beta1Pow = std::pow(adamParams.beta1, stepCounter);
         adamParams.beta2Pow = std::pow(adamParams.beta2, stepCounter);
         adamParams.maxGradNorm = maxGradNorm;
-
-        for (size_t i = 0; i < optWeights.size(); ++i) {
-            FlatCopyParams copyParams{(uint32_t)optWeights[i].size(), (uint32_t)optOffsets[i]};
-            MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer,
-                optGradIsFloat[i] ? gatherFloatPipeline : gatherBfloatPipeline);
-            encoder->setBuffer(optGradBuffers[i], 0, 0);
-            encoder->setBuffer(gradientBuffer, 0, 1);
-            encoder->setBytes(&copyParams, sizeof(copyParams), 2);
-            encoder->dispatchThreads(MTL::Size(copyParams.count, 1, 1), MTL::Size(256, 1, 1));
-            encoder->endEncoding();
-        }
-        encodeZero(commandBuffer, normSqBuffer, 4 * sizeof(float));
         {
-            uint32_t count = (uint32_t)optCount;
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, gradNormPipeline);
-            encoder->setBuffer(gradientBuffer, 0, 0);
-            encoder->setBuffer(normSqBuffer, 0, 1);
-            encoder->setBytes(&count, sizeof(count), 2);
+            encoder->setBuffer(gradFloatArena, 0, 0);
+            encoder->setBuffer(gradBfArena, 0, 1);
+            encoder->setBuffer(normSqBuffer, 0, 2);
+            encoder->setBytes(&adamParams, sizeof(adamParams), 3);
             encoder->dispatchThreads(MTL::Size((optCount + 31) / 32 * 32, 1, 1), MTL::Size(256, 1, 1));
             encoder->endEncoding();
         }
         {
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, stepPipeline);
             encoder->setBuffer(parameterBuffer, 0, 0);
-            encoder->setBuffer(gradientBuffer, 0, 1);
-            encoder->setBuffer(momentumBuffer, 0, 2);
-            encoder->setBuffer(varianceBuffer, 0, 3);
-            encoder->setBytes(&adamParams, sizeof(adamParams), 4);
-            encoder->setBuffer(normSqBuffer, 0, 5);
+            encoder->setBuffer(gradFloatArena, 0, 1);
+            encoder->setBuffer(gradBfArena, 0, 2);
+            encoder->setBuffer(momentumBuffer, 0, 3);
+            encoder->setBuffer(varianceBuffer, 0, 4);
+            encoder->setBuffer(weightArena, 0, 5);
+            encoder->setBuffer(normSqBuffer, 0, 6);
+            encoder->setBytes(&adamParams, sizeof(adamParams), 7);
             encoder->dispatchThreads(MTL::Size(optCount, 1, 1), MTL::Size(256, 1, 1));
-            encoder->endEncoding();
-        }
-        for (size_t i = 0; i < optWeights.size(); ++i) {
-            FlatCopyParams copyParams{(uint32_t)optWeights[i].size(), (uint32_t)optOffsets[i]};
-            MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, scatterPipeline);
-            encoder->setBuffer(parameterBuffer, 0, 0);
-            encoder->setBuffer(optWeightBuffers[i], 0, 1);
-            encoder->setBytes(&copyParams, sizeof(copyParams), 2);
-            encoder->dispatchThreads(MTL::Size(copyParams.count, 1, 1), MTL::Size(256, 1, 1));
             encoder->endEncoding();
         }
     }
@@ -828,24 +885,16 @@ struct Model {
 
     ~Model() {
         auto releaseLayernorm = [](LayernormBuffers& ln) {
-            ln.gammaBuffer->release();
-            ln.betaBuffer->release();
             ln.xnormBuffer->release();
             ln.stdevBuffer->release();
             ln.outBuffer->release();
-            ln.dGammaBuffer->release();
-            ln.dBetaBuffer->release();
         };
         for (BlockBuffers& block : blocks) {
             releaseLayernorm(block.ln);
-            block.upprojBuffer->release();
-            block.downprojBuffer->release();
             block.mlpVBuffer->release();
             block.mlpMaskBuffer->release();
             block.mlpOutBuffer->release();
             block.residualBuffer->release();
-            block.dUpBuffer->release();
-            block.dDpBuffer->release();
         }
         releaseLayernorm(lnFinal);
         valueBuffer->release();
@@ -859,22 +908,21 @@ struct Model {
         advantageSlots->release();
         returnSlots->release();
         advNormBuffer->release();
-        inWBuffer->release();
-        inBBuffer->release();
         inputBuffer->release();
-        dInWBuffer->release();
-        dInBBuffer->release();
-        linearWBuffer->release();
         logitsBuffer->release();
         dLogitsBuffer->release();
-        dLinearWBuffer->release();
         statsBuffer->release();
         dStreamBuffer->release();
         dBranchBuffer->release();
         dXnormBuffer->release();
         dMlpVBuffer->release();
+        dUpPartBuffer->release();
+        dDpPartBuffer->release();
+        dWPartBuffer->release();
+        weightArena->release();
+        gradFloatArena->release();
+        gradBfArena->release();
         parameterBuffer->release();
-        gradientBuffer->release();
         momentumBuffer->release();
         varianceBuffer->release();
         normSqBuffer->release();
@@ -886,6 +934,9 @@ struct Model {
         mlpFwdTwoPipeline->release();
         mlpBwdOnePipeline->release();
         mlpBwdTwoPipeline->release();
+        mlpBwdWeightsPipeline->release();
+        linearBwdDwPipeline->release();
+        reducePipeline->release();
         linearFwdPipeline->release();
         linearBwdPipeline->release();
         policyLossPipeline->release();
@@ -895,8 +946,5 @@ struct Model {
         residualAddPipeline->release();
         gradNormPipeline->release();
         stepPipeline->release();
-        gatherFloatPipeline->release();
-        gatherBfloatPipeline->release();
-        scatterPipeline->release();
     }
 };

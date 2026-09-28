@@ -36,42 +36,58 @@ kernel void linearForward (
     op.run(mX, mW, mO);
 }
 
+//dX = dZ @ W^T, one 64-row tile per threadgroup
 kernel void linearBackward (
-    device bfloat* x [[buffer(0)]],
     device bfloat* w [[buffer(1)]],
     device bfloat* dZ [[buffer(2)]],
     device bfloat* dX [[buffer(3)]],
-    device bfloat* dW [[buffer(4)]],
     constant LinearParams& p [[buffer(5)]],
     uint gid [[threadgroup_position_in_grid]]
 ) {
-    uint z_tiles = p.N / TILE_M;
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Xt(x, dextents<int32_t, 2>(p.K, p.M));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt(w, dextents<int32_t, 2>(p.N, p.K));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dZt(dZ, dextents<int32_t, 2>(p.N, p.M));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dXt(dX, dextents<int32_t, 2>(p.K, p.M));
-    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dWt(dW, dextents<int32_t, 2>(p.N, p.K));
-    constexpr auto desc_dw = matmul2d_descriptor(
-        N_EMBED, // m: dW output rows = embed dim (p.K here)
-        TILE_M,  // n: one 64-wide column tile of the vocab
-        static_cast<int>(dynamic_extent), // k: reduce over all M rows
-        true, false, false, matmul2d_descriptor::mode::multiply_accumulate); //X^T @ dZ
     constexpr auto desc_dx = matmul2d_descriptor(
-        TILE_M,  // m: this threadgroup's row tile
-        N_EMBED, // n: dX output cols = embed dim
-        static_cast<int>(dynamic_extent), // k: reduce over the vocab
+        TILE_M,
+        N_EMBED,
+        static_cast<int>(dynamic_extent),
         false, true, false); //dZ @ W^T
-    matmul2d<desc_dw, execution_simdgroups<4>> dW_op;
     matmul2d<desc_dx, execution_simdgroups<4>> dX_op;
-    const uint global_row_start = gid * 64;
+    const uint global_row_start = gid * TILE_M;
     auto mdZ = dZt.slice(0, global_row_start);
     auto mdX = dXt.slice(0, global_row_start);
     dX_op.run(mdZ, Wt, mdX);
-    //dW column tiles are distributed across threadgroups; each tile reduces over the FULL
-    //unsliced X/dZ, so no tile is touched twice and no rows are double-counted
-    for (uint z_tile = gid; z_tile < z_tiles; z_tile += p.M/TILE_M) {
-        mdZ = dZt.slice(z_tile*TILE_M, 0);
-        auto mdW = dWt.slice(z_tile*TILE_M, 0);
-        dW_op.run(Xt, mdZ, mdW);
-    }
+}
+
+//dWPart[chunk] = X_chunk^T @ dZ_chunk (K x N float). gid.x = 64-wide column
+//tile of N, gid.y = chunk. reducePartials sums the chunks.
+struct LinearWeightParams {
+    uint M;
+    uint N;
+    uint K;
+    uint chunkRows;
+};
+
+kernel void linearBackwardDw (
+    device bfloat* x [[buffer(0)]],
+    device bfloat* dZ [[buffer(1)]],
+    device float* dWPart [[buffer(2)]],
+    constant LinearWeightParams& p [[buffer(3)]],
+    uint2 gid [[threadgroup_position_in_grid]]
+) {
+    const uint tile = gid.x;
+    const uint chunk = gid.y;
+    const uint row0 = chunk * p.chunkRows;
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Xc(x + row0 * p.K, dextents<int32_t, 2>(p.K, p.chunkRows));
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> dZc(dZ + row0 * p.N, dextents<int32_t, 2>(p.N, p.chunkRows));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> dWP(dWPart + chunk * p.K * p.N, dextents<int32_t, 2>(p.N, p.K));
+    constexpr auto desc_dw = matmul2d_descriptor(
+        N_EMBED,
+        TILE_M,
+        static_cast<int>(dynamic_extent),
+        true, false, false); //X^T @ dZ
+    matmul2d<desc_dw, execution_simdgroups<4>> dW_op;
+    auto mdZ = dZc.slice(tile * TILE_M, 0);
+    auto mdW = dWP.slice(tile * TILE_M, 0);
+    dW_op.run(Xc, mdZ, mdW);
 }
