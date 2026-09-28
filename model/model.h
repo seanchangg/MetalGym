@@ -3,6 +3,9 @@
 //collect() runs T steps + GAE in one command buffer; trainSlot(t) runs one PPO
 //minibatch (forward, loss, backward, Adam) in one command buffer.
 //Head row = [logits(ACT_DIM) | value | zero pad] in one 64-wide tile.
+//Discrete: Env::Action is a 4-byte integer, the head holds logits, softmax.
+//Continuous: Env::Action is a struct of ACT_DIM floats, the head holds the
+//means of a Gaussian, and a shared log_std parameter sets the widths.
 //embedDim must equal N_EMBED_CFG (model/config.h). Include after gym.h.
 #pragma once
 
@@ -113,8 +116,12 @@ template <typename Env>
 struct Model {
     static_assert(sizeof(typename Env::Obs) == Env::OBS_DIM * sizeof(float),
                   "Env::Obs must be exactly OBS_DIM floats");
-    static_assert(std::is_integral_v<typename Env::Action> && sizeof(typename Env::Action) == 4,
+    static constexpr bool CONTINUOUS = !std::is_integral_v<typename Env::Action>;
+    static_assert(CONTINUOUS || sizeof(typename Env::Action) == 4,
                   "the softmax head needs a discrete 4-byte Action");
+    static_assert(!CONTINUOUS || sizeof(typename Env::Action) == Env::ACT_DIM * sizeof(float),
+                  "the Gaussian head needs an Action of exactly ACT_DIM floats");
+    static constexpr float INIT_LOG_STD = 0.0f; //continuous only: std 1 at start, see setLogStd()
     static constexpr uint32_t HEAD_DIM = 64; //one linear tile: logits, value, zero padding
     static_assert(Env::ACT_DIM + 1 <= HEAD_DIM, "ACT_DIM + value must fit one 64-wide tile");
 
@@ -207,6 +214,7 @@ struct Model {
     size_t gammaFloatBytes;
     size_t obsSlotBytes;
     size_t rowFloatBytes;
+    size_t actionSlotBytes; //parallels x sizeof(Env::Action)
 
     MTL::Buffer* valueBuffer;
     MTL::Buffer* logProbBuffer;
@@ -234,6 +242,8 @@ struct Model {
 
     LayernormBuffers lnFinal;
     Slice linearW;
+    Slice logStd;  //continuous only, ACT_DIM bf16 in the weight arena
+    Slice dLogStd; //continuous only, ACT_DIM float in the gradient arena
     MTL::Buffer* logitsBuffer;
     MTL::Buffer* dLogitsBuffer;
     Slice dLinearW;
@@ -284,7 +294,8 @@ struct Model {
           hiddenBytes((size_t)g.parallels * e * s * sizeof(__bf16)),
           gammaFloatBytes((size_t)e * sizeof(float)),
           obsSlotBytes((size_t)g.parallels * sizeof(typename Env::Obs)),
-          rowFloatBytes((size_t)g.parallels * sizeof(float)) {
+          rowFloatBytes((size_t)g.parallels * sizeof(float)),
+          actionSlotBytes((size_t)g.parallels * sizeof(typename Env::Action)) {
         if (parallels % tileM != 0 || e % tileN != 0 || e > 1024 || hiddenDim % tileN != 0 || layers < 1 || T < 1) {
             std::cerr << "Model: rows and embedDim must be multiples of 64, embedDim <= 1024, layers >= 1, horizon >= 1\n";
             std::exit(1);
@@ -319,8 +330,8 @@ struct Model {
         reducePipeline = makePipeline(library, "reducePartials");
         linearFwdPipeline = makePipeline(library, "linearForward");
         linearBwdPipeline = makePipeline(library, "linearBackward");
-        policyLossPipeline = makePipeline(library, "policyLossBackward");
-        samplePipeline = makePipeline(library, "sampleAction");
+        policyLossPipeline = makePipeline(library, CONTINUOUS ? "gaussianLossBackward" : "policyLossBackward");
+        samplePipeline = makePipeline(library, CONTINUOUS ? "sampleGaussian" : "sampleAction");
         gaePipeline = makePipeline(library, "gaeBackward");
         normalizePipeline = makePipeline(library, "normalizeAdvantage");
         residualAddPipeline = makePipeline(library, "residualAdd");
@@ -333,7 +344,7 @@ struct Model {
 
         const size_t slotCount = (size_t)horizon * parallels;
         obsSlots = newSharedBuffer((size_t)(horizon + 1) * obsSlotBytes);
-        actionSlots = newSharedBuffer(slotCount * sizeof(uint32_t));
+        actionSlots = newSharedBuffer((size_t)horizon * actionSlotBytes);
         logProbSlots = newSharedBuffer(slotCount * sizeof(float));
         valueSlots = newSharedBuffer(slotCount * sizeof(float));
         rewardSlots = newSharedBuffer(slotCount * sizeof(float));
@@ -341,7 +352,7 @@ struct Model {
         advantageSlots = newSharedBuffer(slotCount * sizeof(float));
         returnSlots = newSharedBuffer(slotCount * sizeof(float));
         advNormBuffer = newSharedBuffer(rowFloatBytes);
-        std::memset(actionSlots->contents(), 0, slotCount * sizeof(uint32_t));
+        std::memset(actionSlots->contents(), 0, (size_t)horizon * actionSlotBytes);
         slotOrder.resize(horizon);
         for (uint32_t t = 0; t < horizon; t++) slotOrder[t] = t;
         hostRng.seed(seed);
@@ -403,6 +414,9 @@ struct Model {
                 }
             }
         }
+        if constexpr (CONTINUOUS) {
+            constant(addParam((size_t)Env::ACT_DIM, true, logStd, dLogStd), INIT_LOG_STD);
+        }
 
         //layout: float-grad params, then bf16-grad params
         const size_t align = 128;
@@ -444,6 +458,23 @@ struct Model {
     float* logProbs() { return static_cast<float*>(logProbBuffer->contents()); }
     float headValue(uint32_t row, uint32_t col) const {
         return (float)static_cast<const __bf16*>(logitsBuffer->contents())[(size_t)row * HEAD_DIM + col];
+    }
+    //continuous only: the shared log standard deviation of action dim k
+    float logStdValue(uint32_t k) const {
+        static_assert(CONTINUOUS, "logStdValue needs a continuous Env::Action");
+        return (float)static_cast<const __bf16*>(weightArena->contents())[logStd.offset / sizeof(__bf16) + k];
+    }
+    //continuous only: overwrite every log_std, for example to start narrower
+    //than INIT_LOG_STD or to act deterministically. Call between train() calls.
+    void setLogStd(float value) {
+        static_assert(CONTINUOUS, "setLogStd needs a continuous Env::Action");
+        const size_t first = logStd.offset / sizeof(__bf16);
+        auto* master = static_cast<float*>(parameterBuffer->contents());
+        auto* weights = static_cast<__bf16*>(weightArena->contents());
+        for (uint32_t k = 0; k < Env::ACT_DIM; ++k) {
+            master[first + k] = value;
+            weights[first + k] = (__bf16)value;
+        }
     }
     typename Env::Obs* slotObs(uint32_t t) { return reinterpret_cast<typename Env::Obs*>(static_cast<char*>(obsSlots->contents()) + t * obsSlotBytes); }
     typename Env::Action* slotActions(uint32_t t) { return static_cast<typename Env::Action*>(actionSlots->contents()) + (size_t)t * parallels; }
@@ -512,6 +543,7 @@ struct Model {
     }
     inline size_t obsOffset(uint32_t t) const { return (size_t)t * obsSlotBytes; }
     inline size_t rowOffset(uint32_t t) const { return (size_t)t * rowFloatBytes; }
+    inline size_t actionOffset(uint32_t t) const { return (size_t)t * actionSlotBytes; }
     inline size_t doneOffset(uint32_t t) const { return (size_t)t * parallels; }
 
     void encodeResidualAdd(MTL::CommandBuffer* commandBuffer, MTL::Buffer* a, MTL::Buffer* b, MTL::Buffer* out) {
@@ -616,6 +648,25 @@ struct Model {
         typename Env::Action* action = gym.actions();
         float* value = values();
         float* logProb = logProbs();
+        if constexpr (CONTINUOUS) {
+            std::normal_distribution<float> normal(0.0f, 1.0f);
+            float* actionF = reinterpret_cast<float*>(action);
+            for (uint32_t row = 0; row < parallels; ++row) {
+                const size_t base = (size_t)row * HEAD_DIM;
+                float lp = 0.0f;
+                for (uint32_t k = 0; k < Env::ACT_DIM; ++k) {
+                    const float ls = logStdValue(k);
+                    const float mu = (float)head[base + k];
+                    const float a = mu + std::exp(ls) * normal(rng);
+                    const float d = (a - mu) * std::exp(-ls);
+                    actionF[(size_t)row * Env::ACT_DIM + k] = a;
+                    lp += -0.5f * d * d - ls - 0.9189385332046727f;
+                }
+                logProb[row] = lp;
+                value[row] = (float)head[base + Env::ACT_DIM];
+            }
+            return;
+        }
         std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
         float logits[Env::ACT_DIM];
         for (uint32_t row = 0; row < parallels; ++row) {
@@ -640,8 +691,16 @@ struct Model {
             value[row] = (float)head[base + Env::ACT_DIM];
         }
     }
+    //discrete: argmax; continuous: the mean
     void actGreedy() {
         typename Env::Action* action = gym.actions();
+        if constexpr (CONTINUOUS) {
+            float* actionF = reinterpret_cast<float*>(action);
+            for (uint32_t row = 0; row < parallels; ++row) {
+                for (uint32_t k = 0; k < Env::ACT_DIM; ++k) actionF[(size_t)row * Env::ACT_DIM + k] = headValue(row, k);
+            }
+            return;
+        }
         for (uint32_t row = 0; row < parallels; ++row) {
             uint32_t best = 0;
             for (uint32_t a = 1; a < Env::ACT_DIM; ++a) {
@@ -654,10 +713,11 @@ struct Model {
         MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, samplePipeline);
         encoder->setBuffer(logitsBuffer, 0, 0);
         encoder->setBuffer(gym.rngBuffer, 0, 1);
-        encoder->setBuffer(actionSlots, rowOffset(t), 2);
+        encoder->setBuffer(actionSlots, actionOffset(t), 2);
         encoder->setBuffer(logProbSlots, rowOffset(t), 3);
         encoder->setBuffer(valueSlots, rowOffset(t), 4);
         encoder->setBytes(&sampleParams, sizeof(sampleParams), 5);
+        if constexpr (CONTINUOUS) bind(encoder, logStd, 6);
         encoder->dispatchThreads(MTL::Size(parallels, 1, 1), MTL::Size(256, 1, 1));
         encoder->endEncoding();
     }
@@ -676,7 +736,7 @@ struct Model {
         for (uint32_t t = 0; t < horizon; ++t) {
             encodeForward(commandBuffer, obsSlots, obsOffset(t));
             encodeSample(commandBuffer, t);
-            gym.encodeStep(commandBuffer, actionSlots, rowOffset(t), obsSlots, obsOffset(t + 1), rewardSlots, rowOffset(t));
+            gym.encodeStep(commandBuffer, actionSlots, actionOffset(t), obsSlots, obsOffset(t + 1), rewardSlots, rowOffset(t));
             //the rollout kernel reads and writes the gym's live done flags; keep a copy per slot
             encodeCopy(commandBuffer, gym.doneBuffer, 0, doneSlots, doneOffset(t), parallels);
         }
@@ -712,27 +772,34 @@ struct Model {
             PolicyParams policyParams{parallels, Env::ACT_DIM, HEAD_DIM, clip, valueCoef, entropyCoef};
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, policyLossPipeline);
             encoder->setBuffer(logitsBuffer, 0, 0);
-            encoder->setBuffer(actionSlots, rowOffset(t), 1);
+            encoder->setBuffer(actionSlots, actionOffset(t), 1);
             encoder->setBuffer(advNormBuffer, 0, 2);
             encoder->setBuffer(returnSlots, rowOffset(t), 3);
             encoder->setBuffer(logProbSlots, rowOffset(t), 4);
             encoder->setBuffer(dLogitsBuffer, 0, 5);
             encoder->setBuffer(statsBuffer, 0, 6);
             encoder->setBytes(&policyParams, sizeof(policyParams), 7);
+            if constexpr (CONTINUOUS) {
+                //the Gaussian loss accumulates the log_std gradient with atomics
+                bind(encoder, logStd, 8);
+                bind(encoder, dLogStd, 9);
+            }
             encoder->dispatchThreads(MTL::Size(parallels, 1, 1), MTL::Size(256, 1, 1));
             encoder->endEncoding();
         }
     }
 
-    void encodeBackward(MTL::CommandBuffer* commandBuffer, MTL::Buffer* obsBuffer, size_t obsByteOffset) {
-        {
-            MTL::BlitCommandEncoder* blit = commandBuffer->blitCommandEncoder();
-            blit->fillBuffer(gradFloatArena, NS::Range::Make(0, optFloatCount * sizeof(float)), 0);
-            blit->fillBuffer(gradBfArena, NS::Range::Make(0, (optCount - optFloatCount) * sizeof(__bf16)), 0);
-            blit->fillBuffer(normSqBuffer, NS::Range::Make(0, 4 * sizeof(float)), 0);
-            blit->endEncoding();
-        }
+    //zero both gradient arenas and the grad-norm accumulator. Runs before the
+    //loss because the Gaussian loss already accumulates into the float arena.
+    void encodeZeroGrads(MTL::CommandBuffer* commandBuffer) {
+        MTL::BlitCommandEncoder* blit = commandBuffer->blitCommandEncoder();
+        blit->fillBuffer(gradFloatArena, NS::Range::Make(0, optFloatCount * sizeof(float)), 0);
+        blit->fillBuffer(gradBfArena, NS::Range::Make(0, (optCount - optFloatCount) * sizeof(__bf16)), 0);
+        blit->fillBuffer(normSqBuffer, NS::Range::Make(0, 4 * sizeof(float)), 0);
+        blit->endEncoding();
+    }
 
+    void encodeBackward(MTL::CommandBuffer* commandBuffer, MTL::Buffer* obsBuffer, size_t obsByteOffset) {
         {
             MTL::ComputeCommandEncoder* encoder = makeEncoder(commandBuffer, linearBwdPipeline);
             bind(encoder, linearW, 1);
@@ -849,6 +916,7 @@ struct Model {
         NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
         encodeForward(commandBuffer, obsSlots, obsOffset(t));
+        encodeZeroGrads(commandBuffer);
         encodeLoss(commandBuffer, t);
         encodeBackward(commandBuffer, obsSlots, obsOffset(t));
         encodeStep(commandBuffer);

@@ -81,8 +81,18 @@ for (int it = 0; it < 100; it++) {
 ```
 
 `Model<Env>` borrows the gym's device, queue, rng, and obs buffer. Nothing is
-copied between the two. The policy is a residual MLP with a softmax head, so
-`Env::Action` must be a 4-byte integer and actions are indices below `ACT_DIM`.
+copied between the two. The policy is a residual MLP. The type of `Env::Action`
+selects the head at compile time:
+
+| `Env::Action` | Head | Action |
+|---|---|---|
+| a 4-byte integer, e.g. `int` | softmax over `ACT_DIM` logits | an index below `ACT_DIM` |
+| a struct of `ACT_DIM` floats, e.g. `struct Action { float torque, bend; };` | Gaussian with `ACT_DIM` means and a learned, shared `log_std` | `ACT_DIM` unbounded floats |
+
+The Gaussian sample is not bounded. Clamp or `tanh` it inside `step()`.
+`log_std` starts at 0 (std 1); `model.setLogStd(v)` overwrites it and
+`model.logStdValue(k)` reads it. `examples/CartPoleContinuous` is the
+continuous template.
 
 `train(epochs)` takes the epoch count; the default is 4. Both calls block
 until the GPU finishes.
@@ -112,7 +122,8 @@ Mean episode length, the usual CartPole score, is a loop over `slotDones`.
 | Method | Type | Meaning |
 |---|---|---|
 | `model.lastStats()` | `LossStats` | batch means from the most recent minibatch |
-| `model.headValue(row, col)` | `float` | raw head output of the last forward: logit at `col < ACT_DIM`, value at `col == ACT_DIM` |
+| `model.headValue(row, col)` | `float` | raw head output of the last forward: logit or mean at `col < ACT_DIM`, value at `col == ACT_DIM` |
+| `model.logStdValue(k)` | `float` | continuous only: the shared log standard deviation of action dim `k` |
 
 `LossStats` fields: `policy` (clipped surrogate), `value`, `entropy`,
 `approxKl` (mean `oldLogProb - newLogProb`), `clipFrac` (share of rows outside
@@ -132,7 +143,7 @@ For evaluation or a hand-written policy, drive the gym one step at a time.
 |---|---|
 | `model.forward()` | policy forward on `gym.obs()`; head in the model |
 | `model.act(rng)` | sample one action per env into `gym.actions()`; also fills `model.values()` and `model.logProbs()` |
-| `model.actGreedy()` | argmax action per env into `gym.actions()` |
+| `model.actGreedy()` | argmax action (discrete) or the mean (continuous) per env into `gym.actions()` |
 | `gym.run(reward)` | one env step; `reward` gets one float per env |
 | `gym.obs()` | `Env::Obs*`, the live obs |
 | `gym.actions()` | `Env::Action*`, written before `run` |

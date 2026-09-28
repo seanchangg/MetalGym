@@ -52,5 +52,6 @@ endfunction()
 
 metalrl_example(cartpole examples/CartPole/main.cpp)
 metalrl_example(voxelnav examples/VoxelNav/main.cpp)
+metalrl_example(cartpole_continuous examples/CartPoleContinuous/main.cpp)
 metalrl_example(bench_cartpole bench/metalrl_bench.cpp)
 metalrl_example(bench_voxelnav bench/metalrl_bench_voxelnav.cpp)
