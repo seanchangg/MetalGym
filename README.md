@@ -182,14 +182,7 @@ success in 200 iterations, about 100 seconds.
 | JAX 0.4.34 + jax-metal, same env | about 300 steps/s at 256 envs | not run | not run |
 
 The JAX twin is `bench/jax_voxelnav_bench.py`, the same generator, camera,
-actions, and reward written with vmap. Under jax-metal a gather of 47
-terrain samples takes 23 ms for 256 environments, and the camera needs 1504
-gathers per environment, so one step takes about a second. The CPU backend
-runs the same code at full speed. PufferLib has no equivalent environment.
-
-Of the frameworks measured here, MetalGym is the fastest GPU-resident RL loop on
-Apple silicon for these two tasks. That is the extent of the claim. The
-programs are in `bench/`:
+actions, and reward written with vmap. The jax-metal gather kernel seems to be broken, taking 23ms per 256 environments, so not sure what's going on there. Fallback to CPU runs the same code at full speed. 
 
 ```sh
 clang++ -std=c++20 -O2 -I. -I$METAL_CPP_DIR bench/MetalGym_bench.cpp -o bench_MetalGym \
