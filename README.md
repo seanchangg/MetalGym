@@ -203,12 +203,14 @@ different path.
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/MetalGym
+./build/cartpole      # or ./build/voxelnav, ./build/bench_cartpole, ./build/bench_voxelnav
 ```
 
-The build compiles every `.metal` file it globs into `default.metallib` next
-to the executable. Run the first `cmake` command again after you add or remove
-a `.metal` file.
+Every `.metal` file in the root, `model/`, and `examples/*/` compiles into one
+`default.metallib` next to the executables. The shader list is a glob, so run
+the first `cmake` command again after you add a `.metal` file. To add an
+example, add one `metalrl_example(name path/to/main.cpp)` line to
+`CMakeLists.txt`.
 
 The network width is a compile-time constant in `model/config.h`
 (`N_EMBED_CFG`, default 128), because the Metal matmul descriptors need it.
