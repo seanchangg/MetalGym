@@ -1,10 +1,7 @@
+//flat-parameter Adam: gather grads -> normSq -> adamStep (clips by global norm) -> scatter bf16 weights
 #include <metal_stdlib>
 using namespace metal;
 
-//Adam on a flat float master copy of every parameter. The host registers each
-//parameter with an offset into the flat layout; gather* copies that
-//parameter's gradient buffer into the flat gradient, adamStep updates the
-//master copy, and scatterWeight writes the bf16 weights the kernels read.
 struct FlatCopyParams {
     uint count;
     uint offset;
@@ -16,9 +13,9 @@ struct AdamParams {
     float beta1;
     float beta2;
     float eps;
-    float beta1Pow;  //beta1^t, for bias correction
-    float beta2Pow;  //beta2^t
-    float gradScale; //global-norm clipping factor, 1 when unclipped
+    float beta1Pow;
+    float beta2Pow;
+    float maxGradNorm;
 };
 
 kernel void gatherGradFloat(
@@ -51,16 +48,31 @@ kernel void scatterWeight(
     dst[tid] = bfloat(master[p.offset + tid]);
 }
 
+kernel void gradNormSq(
+    device const float* grad [[buffer(0)]],
+    device atomic_float* normSq [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint tid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    float g = (tid < count) ? grad[tid] : 0.0f;
+    float partial = simd_sum(g * g);
+    if (lane == 0) atomic_fetch_add_explicit(normSq, partial, memory_order_relaxed);
+}
+
 kernel void adamStep(
     device float* param [[buffer(0)]],
     device const float* grad [[buffer(1)]],
     device float* momentum [[buffer(2)]],
     device float* variance [[buffer(3)]],
     constant AdamParams& p [[buffer(4)]],
+    device const float* normSq [[buffer(5)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= p.count) return;
-    float g = grad[tid] * p.gradScale;
+    const float norm = sqrt(normSq[0]);
+    const float scale = (p.maxGradNorm > 0.0f && norm > p.maxGradNorm) ? p.maxGradNorm / (norm + 1e-6f) : 1.0f;
+    float g = grad[tid] * scale;
     float m = p.beta1 * momentum[tid] + (1.0f - p.beta1) * g;
     float v = p.beta2 * variance[tid] + (1.0f - p.beta2) * g * g;
     momentum[tid] = m;

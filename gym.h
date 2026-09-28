@@ -87,22 +87,31 @@ struct Gym {
     uint8_t* done() { return static_cast<uint8_t*>(doneBuffer->contents()); }
     typename Env::Obs* obs() { return static_cast<typename Env::Obs*>(obsBuffer->contents()); }
 
+    //Encode one env step into an existing command buffer without committing.
+    //The state, done, and rng buffers are always the gym's own. The actions
+    //read, and the obs and reward written, can come from any buffer at any
+    //byte offset, so a caller can point them at slot t of a rollout buffer.
+    void encodeStep(MTL::CommandBuffer* commandBuffer,
+                    MTL::Buffer* actionsIn, size_t actionOffset,
+                    MTL::Buffer* obsOut, size_t obsOffset,
+                    MTL::Buffer* rewardOut, size_t rewardOffset) {
+        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
+        encoder->setComputePipelineState(pipelineState);
+        encoder->setBuffer(stateBuffer, 0, 0);
+        encoder->setBuffer(actionsIn, actionOffset, 1);
+        encoder->setBuffer(obsOut, obsOffset, 2);
+        encoder->setBuffer(rewardOut, rewardOffset, 3);
+        encoder->setBuffer(doneBuffer, 0, 4);
+        encoder->setBuffer(rngBuffer, 0, 5);
+        encoder->dispatchThreads(MTL::Size(parallels, 1, 1), MTL::Size(pipelineState->maxTotalThreadsPerThreadgroup(), 1, 1));
+        encoder->endEncoding();
+    }
+
     void run(std::vector<float>& reward) {
         //command buffers are autoreleased; drain them per step or the pool grows
         NS::AutoreleasePool* stepPool = NS::AutoreleasePool::alloc()->init();
         MTL::CommandBuffer* commandBuffer = commandQueue->commandBuffer();
-        MTL::ComputeCommandEncoder* encoder = commandBuffer->computeCommandEncoder();
-
-        encoder->setComputePipelineState(pipelineState);
-        encoder->setBuffer(stateBuffer, 0, 0);
-        encoder->setBuffer(actionBuffer, 0, 1);
-        encoder->setBuffer(obsBuffer, 0, 2);
-        encoder->setBuffer(rewardBuffer, 0, 3);
-        encoder->setBuffer(doneBuffer, 0, 4);
-        encoder->setBuffer(rngBuffer, 0, 5);
-        encoder->dispatchThreads(MTL::Size(parallels, 1, 1), MTL::Size(pipelineState->maxTotalThreadsPerThreadgroup(), 1, 1));
-        
-        encoder->endEncoding();
+        encodeStep(commandBuffer, actionBuffer, 0, obsBuffer, 0, rewardBuffer, 0);
         commandBuffer->commit();
         commandBuffer->waitUntilCompleted();
         

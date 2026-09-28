@@ -1,7 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-//out = a + b over one activation-sized bf16 tensor. out may alias a or b.
 kernel void residualAdd(
     device const bfloat* a [[buffer(0)]],
     device const bfloat* b [[buffer(1)]],
