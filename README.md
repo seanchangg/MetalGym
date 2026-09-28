@@ -1,8 +1,18 @@
 # metalRL
 
-The **fastest** reinforcement learning framework on Apple Metal. Each environment runs one
-instance per GPU thread. The framework handles the rollout kernel, the random
-numbers, and a fused MLP inference. You write the environment.
+The **fastest** reinforcement learning framework on Apple Metal. You write the environment, and the framework handles the rollout kernel, the random
+numbers, and a fused MLP inference. 
+
+Performance comparisons:
+| | env steps/s | with policy | full PPO loop |
+|---|---|---|---|
+| CartPole, metalRL | 27 M | 3.8 M | 296 K |
+| CartPole, JAX + jax-metal + gymnax | 1.5 M | 1.7 M | 180 K |
+| CartPole, PufferLib 2.0.6, torch CPU | 0.9 M | 0.17 M | 56 K |
+| VoxelNav, metalRL | 7.9 M | 2.4 M | 265 K |
+| VoxelNav, JAX on CPU (jax-metal cannot run it, see below) | 0.44 M | 0.27 M | 47 K |
+
+Configuration and the other rows are in [Bench](#bench).
 
 ## Environment template
 
@@ -134,6 +144,62 @@ The `done` buffer starts at 1, so the first step resets every environment.
 When an environment finishes an episode, the next step resets it and steps
 once with the action given.
 
+## Benchmarks
+
+Apple M4, 10 GPU cores, macOS 26. CartPole, 4096 environments, 32-step
+rollouts, PPO with 4 epochs and a minibatch of 4096. Steps per second means
+environment steps. "Collect" includes the policy forward and GAE. "Full loop"
+includes training. Higher is better.
+
+| | env step only | collect | full loop |
+|---|---|---|---|
+| metalRL, 1 block | 27 M | 6.7 M | 496 K |
+| metalRL, 2 blocks | 27 M | 3.8 M | 296 K |
+| JAX 0.4.34 + jax-metal + gymnax, plain 128-512-128 MLP | 1.5 M (6.2 M scanned) | 2.4 M | 399 K |
+| JAX 0.4.34 + jax-metal + gymnax, same 2-block policy | 1.5 M (6.2 M scanned) | 1.7 M | 180 K |
+| PufferLib 2.0.6, Gymnasium CartPole, 8 workers, torch CPU | 0.9 M | 0.17 M | 56 K |
+
+"Scanned" is 100 env steps inside one `jax.lax.scan`, which is the fastest
+way to drive gymnax. The JAX policies run in fp32; metalRL runs bf16 matmuls
+with fp32 accumulation. PufferLib has no Apple GPU backend, so its row is the
+configuration a PufferLib user gets on a Mac. PufferLib's native C
+environments step at about 94 M steps per second on this machine, but there is
+no CartPole among them.
+
+### VoxelNav
+
+`examples/VoxelNav` is a heavier environment after minetrix's bridge task:
+a 32 x 32 heightmap with a chasm, six actions including cobble placement, a
+depth camera of 32 rays traced through the heightmap, and potential-based
+reward shaping. State is about 1 KB per environment. PPO reaches 93 percent
+success in 200 iterations, about 100 seconds.
+
+| | env step only | collect | full loop |
+|---|---|---|---|
+| metalRL, 1 block | 7.9 M | 3.3 M | 413 K |
+| metalRL, 2 blocks | 7.9 M | 2.4 M | 265 K |
+| JAX 0.4.34 on CPU, same env in jnp, 2-block policy | 0.44 M (0.93 M scanned) | 0.27 M | 47 K |
+| JAX 0.4.34 + jax-metal, same env | about 300 steps/s at 256 envs | not run | not run |
+
+The JAX twin is `bench/jax_voxelnav_bench.py`, the same generator, camera,
+actions, and reward written with vmap. Under jax-metal a gather of 47
+terrain samples takes 23 ms for 256 environments, and the camera needs 1504
+gathers per environment, so one step takes about a second. The CPU backend
+runs the same code at full speed. PufferLib has no equivalent environment.
+
+Of the frameworks measured here, metalRL is the fastest GPU-resident RL loop on
+Apple silicon for these two tasks. That is the extent of the claim. The
+programs are in `bench/`:
+
+```sh
+clang++ -std=c++20 -O2 -I. -I$METAL_CPP_DIR bench/metalrl_bench.cpp -o bench_metalrl \
+    -framework Metal -framework Foundation -framework QuartzCore
+./bench_metalrl 4096 2          # envs, blocks; needs default.metallib next to it
+python bench/jax_bench.py 4096  # pip install "jax==0.4.34" "jaxlib==0.4.34" jax-metal gymnax optax flax
+python bench/puffer_bench.py    # pip install "pufferlib==2.0.6" gymnasium torch
+# VoxelNav: bench/metalrl_bench_voxelnav.cpp the same way; JAX_PLATFORMS=cpu python bench/jax_voxelnav_bench.py 4096
+```
+
 ## Build
 
 Requirements: Xcode command line tools, CMake 3.20 or newer, and the
@@ -165,3 +231,5 @@ The `Model` constructor checks its `embedDim` against it.
 | `model/config.h` | `N_EMBED_CFG`, shared by the shaders and the host |
 | `model/*.metal` | The network kernels: input projection, layernorm, mlp, head, PPO loss, sampler, GAE, Adam |
 | `examples/CartPole/` | The CartPole environment and the minimum training loop |
+| `examples/VoxelNav/` | Heightmap navigation with bridging, a 32-ray depth camera, and a success-rate print |
+| `bench/` | Throughput benchmarks: metalRL, JAX + gymnax, PufferLib |
