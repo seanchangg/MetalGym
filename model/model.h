@@ -188,6 +188,8 @@ struct Model {
     MTL::Buffer* returnSlots;
     MTL::Buffer* advNormBuffer;
     bool rolloutStarted = false;
+    std::vector<uint32_t> slotOrder;
+    std::mt19937 hostRng;
 
     MTL::Buffer* inWBuffer;
     MTL::Buffer* inBBuffer;
@@ -287,6 +289,9 @@ struct Model {
         returnSlots = newSharedBuffer(slotCount * sizeof(float));
         advNormBuffer = newSharedBuffer(rowFloatBytes);
         std::memset(actionSlots->contents(), 0, slotCount * sizeof(uint32_t));
+        slotOrder.resize(horizon);
+        for (uint32_t t = 0; t < horizon; t++) slotOrder[t] = t;
+        hostRng.seed(seed);
 
         inWBuffer = newSharedBuffer((size_t)Env::OBS_DIM * embedDim * sizeof(__bf16));
         inBBuffer = newSharedBuffer((size_t)embedDim * sizeof(__bf16));
@@ -794,8 +799,11 @@ struct Model {
         pool->release();
     }
 
-    void train() {
-        for (uint32_t t = 0; t < horizon; t++) trainSlot(t);
+    void train(uint32_t epochs = 4) {
+        for (uint32_t e = 0; e < epochs; e++) {
+            std::shuffle(slotOrder.begin(), slotOrder.end(), hostRng);
+            for (uint32_t t : slotOrder) trainSlot(t);
+        }
     }
 
     LossStats lastStats() const {

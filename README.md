@@ -55,6 +55,85 @@ struct Environment {
 };
 ```
 
+## Minimum training loop
+
+```cpp
+#include "gym.h"
+#include "model/model.h"
+
+Gym<Environment> gym(4096);                    //4096 environments, one per GPU thread
+Model<Environment> model(gym, 128, 4, 2, 3e-4f, 32); //embed 128, mlp x4, 2 blocks, lr, 32 steps per rollout
+
+for (int it = 0; it < 100; it++) {
+    model.collect(); //T env steps + GAE, one GPU submission
+    model.train();   //4 shuffled PPO epochs over the rollout, one GPU submission per minibatch
+}
+```
+
+`Model<Env>` borrows the gym's device, queue, rng, and obs buffer. Nothing is
+copied between the two. The policy is a residual MLP with a softmax head, so
+`Env::Action` must be a 4-byte integer and actions are indices below `ACT_DIM`.
+
+`train(epochs)` takes the epoch count; the default is 4. Both calls block
+until the GPU finishes.
+
+## Observability
+
+Everything below is a read of a shared buffer. None of it runs unless called.
+
+### After `collect()`
+
+One entry per environment, for step `t` of the last rollout, `0 <= t < T`.
+
+| Method | Type | Meaning |
+|---|---|---|
+| `model.slotObs(t)` | `Env::Obs*` | the obs the policy saw at step `t` |
+| `model.slotActions(t)` | `Env::Action*` | the action it took |
+| `model.slotRewards(t)` | `float*` | the reward the env returned |
+| `model.slotDones(t)` | `uint8_t*` | 1 if the episode ended on this step |
+| `model.slotValues(t)` | `float*` | the critic's value estimate |
+| `model.slotAdvantages(t)` | `float*` | GAE advantage |
+| `model.slotReturns(t)` | `float*` | value target, advantage + value |
+
+Mean episode length, the usual CartPole score, is a loop over `slotDones`.
+
+### After `train()` or `trainSlot(t)`
+
+| Method | Type | Meaning |
+|---|---|---|
+| `model.lastStats()` | `LossStats` | batch means from the most recent minibatch |
+| `model.headValue(row, col)` | `float` | raw head output of the last forward: logit at `col < ACT_DIM`, value at `col == ACT_DIM` |
+
+`LossStats` fields: `policy` (clipped surrogate), `value`, `entropy`,
+`approxKl` (mean `oldLogProb - newLogProb`), `clipFrac` (share of rows outside
+the clip band), `gradNorm` (before clipping).
+
+### Hyperparameters
+
+Public fields on the model, read on every call: `clip` 0.2, `valueCoef` 0.5,
+`entropyCoef` 0.01, `maxGradNorm` 0.5 (0 disables), `gamma` 0.99,
+`lambda` 0.95.
+
+### Manual stepping
+
+For evaluation or a hand-written policy, drive the gym one step at a time.
+
+| Call | Effect |
+|---|---|
+| `model.forward()` | policy forward on `gym.obs()`; head in the model |
+| `model.act(rng)` | sample one action per env into `gym.actions()`; also fills `model.values()` and `model.logProbs()` |
+| `model.actGreedy()` | argmax action per env into `gym.actions()` |
+| `gym.run(reward)` | one env step; `reward` gets one float per env |
+| `gym.obs()` | `Env::Obs*`, the live obs |
+| `gym.actions()` | `Env::Action*`, written before `run` |
+| `gym.done()` | `uint8_t*`, 1 when the episode ended on this step |
+
+A random policy is a loop that writes `gym.actions()` and calls `gym.run()`.
+
+The `done` buffer starts at 1, so the first step resets every environment.
+When an environment finishes an episode, the next step resets it and steps
+once with the action given.
+
 ## Build
 
 Requirements: Xcode command line tools, CMake 3.20 or newer, and the
@@ -68,48 +147,21 @@ cmake --build build
 ./build/metalRL
 ```
 
-The build compiles every `.metal` file in the project root into
-`default.metallib` next to the executable. The shader list is a glob, so run
-the first `cmake` command again after you add or remove a `.metal` file.
+The build compiles every `.metal` file it globs into `default.metallib` next
+to the executable. Run the first `cmake` command again after you add or remove
+a `.metal` file.
 
-## Usage
-
-`Gym<Env>` owns the Metal device, the pipeline, and one buffer per kernel
-argument. The host writes actions, calls `run`, and reads the results.
-
-```cpp
-#include "gym.h"
-
-Gym<CartPole> gym(4096);          //4096 environments, one per GPU thread
-std::vector<float> reward(4096);
-
-CartPole::Action* actions = gym.actions(); //one Action per env, written before each step
-for (int i = 0; i < 4096; i++) actions[i] = 0;
-
-gym.run(reward);                  //one step for every env
-
-CartPole::Obs* obs = gym.obs();   //one Obs per env
-float* flat = gym.obsFlat();      //the same buffer as OBS_DIM floats per env
-uint8_t* done = gym.done();       //1 when the episode ended on this step
-```
-
-`State`, `Action`, and `Obs` are plain structs of 4-byte scalars, so the
-host and Metal layouts match. Both sides check that `Obs` is exactly
-`OBS_DIM` floats, which lets the policy read the obs buffer as a flat matrix.
-
-The `done` buffer starts at 1, so the first `run` resets every environment.
-When an environment finishes an episode, the next `run` resets it and steps
-once with the action given.
-
-`main.cpp` runs CartPole with a random policy and prints the mean episode
-length. Gymnasium CartPole-v1 gives about 22 with the same policy, which
-checks the physics.
+The network width is a compile-time constant in `model/config.h`
+(`N_EMBED_CFG`, default 128), because the Metal matmul descriptors need it.
+The `Model` constructor checks its `embedDim` against it.
 
 ## Files
 
 | File | Contents |
 |---|---|
 | `rollout.h` | The rollout kernel template and the per-env random number helpers |
-| `cartpole.metal` | The CartPole environment and its kernel instantiation |
-| `gym.h` | The host side: device setup, buffers, and the `run` loop |
-| `main.cpp` | The host `CartPole` struct and the random policy check |
+| `gym.h` | The env runtime: device, buffers, `run`, and `encodeStep` |
+| `model/model.h` | `Model<Env>`: the policy, `collect`, `train`, and the accessors above |
+| `model/config.h` | `N_EMBED_CFG`, shared by the shaders and the host |
+| `model/*.metal` | The network kernels: input projection, layernorm, mlp, head, PPO loss, sampler, GAE, Adam |
+| `examples/CartPole/` | The CartPole environment and the minimum training loop |

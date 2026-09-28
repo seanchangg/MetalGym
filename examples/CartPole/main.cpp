@@ -1,5 +1,5 @@
-#include "../../gym.h"
-#include "../../model/model.h"
+#include "gym.h"
+#include "model/model.h"
 #include <cstdio>
 
 struct CartPole {

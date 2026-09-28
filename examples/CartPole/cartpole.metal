@@ -1,5 +1,5 @@
 #include <metal_stdlib>
-#include "../../rollout.h"
+#include "rollout.h"
 using namespace metal;
 
 struct CartPole {
