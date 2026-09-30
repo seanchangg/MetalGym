@@ -1,5 +1,5 @@
 #include "gym.h"
-#include "model/model.h"
+#include "model/ppo.h"
 #include <cstdio>
 
 struct CartPole {
@@ -22,7 +22,7 @@ int main() {
     const uint32_t T = 32;   //steps per rollout
 
     Gym<CartPole> gym(N);
-    Model<CartPole> model(gym, 128, 4, 2, 3e-4f, T); //gym, embed dimension, hidden scale factor, layers, lr, rollout buffer length
+    PPOModel<CartPole> model(gym, 128, 4, 2, 3e-4f, T); //gym, embed dimension, hidden scale factor, layers, lr, rollout buffer length
 
     for (int it = 0; it < 40; it++) {
         model.collect();

@@ -69,10 +69,10 @@ struct Environment {
 
 ```cpp
 #include "gym.h"
-#include "model/model.h"
+#include "model/ppo.h"
 
 Gym<Environment> gym(4096);                    //4096 environments, one per GPU thread
-Model<Environment> model(gym, 128, 4, 2, 3e-4f, 32); //embed 128, mlp x4, 2 blocks, lr, 32 steps per rollout
+PPOModel<Environment> model(gym, 128, 4, 2, 3e-4f, 32); //embed 128, mlp x4, 2 blocks, lr, 32 steps per rollout
 
 for (int it = 0; it < 100; it++) {
     model.collect(); //T env steps + GAE, one GPU submission
@@ -80,7 +80,7 @@ for (int it = 0; it < 100; it++) {
 }
 ```
 
-`Model<Env>` borrows the gym's device, queue, rng, and obs buffer. Nothing is
+`PPOModel<Env>` borrows the gym's device, queue, rng, and obs buffer. Nothing is
 copied between the two. The policy is a residual MLP. The type of `Env::Action`
 selects the head at compile time:
 
@@ -225,7 +225,7 @@ example, add one `metalrl_example(name path/to/main.cpp)` line to
 
 The network width is a compile-time constant in `model/config.h`
 (`N_EMBED_CFG`, default 128), because the Metal matmul descriptors need it.
-The `Model` constructor checks its `embedDim` against it.
+The `PPOModel` constructor checks its `embedDim` against it.
 
 ## Files
 
@@ -233,7 +233,7 @@ The `Model` constructor checks its `embedDim` against it.
 |---|---|
 | `rollout.h` | The rollout kernel template and the per-env random number helpers |
 | `gym.h` | The env runtime: device, buffers, `run`, and `encodeStep` |
-| `model/model.h` | `Model<Env>`: the policy, `collect`, `train`, and the accessors above |
+| `model/ppo.h` | `PPOModel<Env>`: the policy, `collect`, `train`, and the accessors above |
 | `model/config.h` | `N_EMBED_CFG`, shared by the shaders and the host |
 | `model/*.metal` | The network kernels: input projection, layernorm, mlp, head, PPO loss, sampler, GAE, Adam |
 | `examples/CartPole/` | The CartPole environment and the minimum training loop |

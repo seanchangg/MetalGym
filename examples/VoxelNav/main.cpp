@@ -1,5 +1,5 @@
 #include "gym.h"
-#include "model/model.h"
+#include "model/ppo.h"
 #include <cstdio>
 
 struct VoxelNav {
@@ -29,7 +29,7 @@ int main() {
     const uint32_t T = 32;
 
     Gym<VoxelNav> gym(N);
-    Model<VoxelNav> model(gym, 128, 4, 2, 3e-4f, T);
+    PPOModel<VoxelNav> model(gym, 128, 4, 2, 3e-4f, T);
 
     for (int it = 0; it < 200; it++) {
         model.collect();

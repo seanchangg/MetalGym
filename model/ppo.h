@@ -1,12 +1,3 @@
-//Actor-critic policy shared by every env row. Borrows the gym's device, queue,
-//rng, and obs buffer. Manual path: forward(), act(rng), gym.run(). Fused path:
-//collect() runs T steps + GAE in one command buffer; trainSlot(t) runs one PPO
-//minibatch (forward, loss, backward, Adam) in one command buffer.
-//Head row = [logits(ACT_DIM) | value | zero pad] in one 64-wide tile.
-//Discrete: Env::Action is a 4-byte integer, the head holds logits, softmax.
-//Continuous: Env::Action is a struct of ACT_DIM floats, the head holds the
-//means of a Gaussian, and a shared log_std parameter sets the widths.
-//embedDim must equal N_EMBED_CFG (model/config.h). Include after gym.h.
 #pragma once
 
 #include <Foundation/Foundation.hpp>
@@ -113,7 +104,7 @@ struct LossStats {
 };
 
 template <typename Env>
-struct Model {
+struct PPOModel {
     static_assert(sizeof(typename Env::Obs) == Env::OBS_DIM * sizeof(float),
                   "Env::Obs must be exactly OBS_DIM floats");
     static constexpr bool CONTINUOUS = !std::is_integral_v<typename Env::Action>;
@@ -280,7 +271,7 @@ struct Model {
     MTL::Buffer* varianceBuffer;
     MTL::Buffer* normSqBuffer;
 
-    Model(Gym<Env>& g, int e, int s, int layers, float learningRate, int T = 32, uint32_t seed = 0)
+    PPOModel(Gym<Env>& g, int e, int s, int layers, float learningRate, int T = 32, uint32_t seed = 0)
         : gym(g), parallels(g.parallels), horizon((uint32_t)T), embedDim(e), mlpScale(s), nLayers(layers), lr(learningRate),
           hiddenDim(e * s), tileRows(g.parallels / tileM), tileCols(e / tileN),
           activationCount((uint32_t)(g.parallels * e)),
@@ -297,11 +288,11 @@ struct Model {
           rowFloatBytes((size_t)g.parallels * sizeof(float)),
           actionSlotBytes((size_t)g.parallels * sizeof(typename Env::Action)) {
         if (parallels % tileM != 0 || e % tileN != 0 || e > 1024 || hiddenDim % tileN != 0 || layers < 1 || T < 1) {
-            std::cerr << "Model: rows and embedDim must be multiples of 64, embedDim <= 1024, layers >= 1, horizon >= 1\n";
+            std::cerr << "PPOModel: rows and embedDim must be multiples of 64, embedDim <= 1024, layers >= 1, horizon >= 1\n";
             std::exit(1);
         }
         if (e != N_EMBED_CFG) {
-            std::cerr << "Model: embedDim " << e << " != N_EMBED_CFG " << N_EMBED_CFG
+            std::cerr << "PPOModel: embedDim " << e << " != N_EMBED_CFG " << N_EMBED_CFG
                       << " from model/config.h\n";
             std::exit(1);
         }
@@ -665,30 +656,30 @@ struct Model {
                 logProb[row] = lp;
                 value[row] = (float)head[base + Env::ACT_DIM];
             }
-            return;
-        }
-        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-        float logits[Env::ACT_DIM];
-        for (uint32_t row = 0; row < parallels; ++row) {
-            const size_t base = (size_t)row * HEAD_DIM;
-            float rowMax = -INFINITY;
-            for (uint32_t a = 0; a < Env::ACT_DIM; ++a) {
-                logits[a] = (float)head[base + a];
-                rowMax = std::max(rowMax, logits[a]);
+        } else {
+            std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+            float logits[Env::ACT_DIM];
+            for (uint32_t row = 0; row < parallels; ++row) {
+                const size_t base = (size_t)row * HEAD_DIM;
+                float rowMax = -INFINITY;
+                for (uint32_t a = 0; a < Env::ACT_DIM; ++a) {
+                    logits[a] = (float)head[base + a];
+                    rowMax = std::max(rowMax, logits[a]);
+                }
+                float sum = 0.0f;
+                for (uint32_t a = 0; a < Env::ACT_DIM; ++a) sum += std::exp(logits[a] - rowMax);
+                const float lse = rowMax + std::log(sum);
+                const float u = uniform(rng) * sum;
+                uint32_t chosen = Env::ACT_DIM - 1;
+                float acc = 0.0f;
+                for (uint32_t a = 0; a < Env::ACT_DIM; ++a) {
+                    acc += std::exp(logits[a] - rowMax);
+                    if (u < acc) { chosen = a; break; }
+                }
+                action[row] = (typename Env::Action)chosen;
+                logProb[row] = logits[chosen] - lse;
+                value[row] = (float)head[base + Env::ACT_DIM];
             }
-            float sum = 0.0f;
-            for (uint32_t a = 0; a < Env::ACT_DIM; ++a) sum += std::exp(logits[a] - rowMax);
-            const float lse = rowMax + std::log(sum);
-            const float u = uniform(rng) * sum;
-            uint32_t chosen = Env::ACT_DIM - 1;
-            float acc = 0.0f;
-            for (uint32_t a = 0; a < Env::ACT_DIM; ++a) {
-                acc += std::exp(logits[a] - rowMax);
-                if (u < acc) { chosen = a; break; }
-            }
-            action[row] = (typename Env::Action)chosen;
-            logProb[row] = logits[chosen] - lse;
-            value[row] = (float)head[base + Env::ACT_DIM];
         }
     }
     //discrete: argmax; continuous: the mean
@@ -699,14 +690,14 @@ struct Model {
             for (uint32_t row = 0; row < parallels; ++row) {
                 for (uint32_t k = 0; k < Env::ACT_DIM; ++k) actionF[(size_t)row * Env::ACT_DIM + k] = headValue(row, k);
             }
-            return;
-        }
-        for (uint32_t row = 0; row < parallels; ++row) {
-            uint32_t best = 0;
-            for (uint32_t a = 1; a < Env::ACT_DIM; ++a) {
-                if (headValue(row, a) > headValue(row, best)) best = a;
+        } else {
+            for (uint32_t row = 0; row < parallels; ++row) {
+                uint32_t best = 0;
+                for (uint32_t a = 1; a < Env::ACT_DIM; ++a) {
+                    if (headValue(row, a) > headValue(row, best)) best = a;
+                }
+                action[row] = (typename Env::Action)best;
             }
-            action[row] = (typename Env::Action)best;
         }
     }
     void encodeSample(MTL::CommandBuffer* commandBuffer, uint32_t t) {
@@ -951,7 +942,7 @@ struct Model {
         return stats;
     }
 
-    ~Model() {
+    ~PPOModel() {
         auto releaseLayernorm = [](LayernormBuffers& ln) {
             ln.xnormBuffer->release();
             ln.stdevBuffer->release();

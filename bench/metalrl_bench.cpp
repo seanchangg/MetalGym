@@ -1,5 +1,5 @@
 #include "gym.h"
-#include "model/model.h"
+#include "model/ppo.h"
 #include <chrono>
 #include <cstdio>
 struct CartPole {
@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
     const uint32_t N = argc > 1 ? std::atoi(argv[1]) : 4096, T = 32; const int L = argc > 2 ? std::atoi(argv[2]) : 2;
     const int ITERS = 20;
     Gym<CartPole> gym(N);
-    Model<CartPole> model(gym, 128, 4, L, 3e-4f, T);
+    PPOModel<CartPole> model(gym, 128, 4, L, 3e-4f, T);
     std::vector<float> reward(N);
     //warm-up
     model.collect(); model.train();

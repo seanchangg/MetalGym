@@ -1,7 +1,7 @@
 //Continuous-action CartPole. Env::Action is a struct of ACT_DIM floats, so
-//Model selects the Gaussian head and learns a shared log_std.
+//PPOModel selects the Gaussian head and learns a shared log_std.
 #include "gym.h"
-#include "model/model.h"
+#include "model/ppo.h"
 #include <cstdio>
 
 struct CartPoleContinuous {
@@ -24,7 +24,7 @@ int main() {
     const uint32_t T = 32;
 
     Gym<CartPoleContinuous> gym(N);
-    Model<CartPoleContinuous> model(gym, 128, 4, 2, 3e-4f, T);
+    PPOModel<CartPoleContinuous> model(gym, 128, 4, 2, 3e-4f, T);
 
     for (int it = 0; it < 60; it++) {
         model.collect();
